@@ -48,6 +48,9 @@ services:
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - STOCK_VIDEO_COUNT=${STOCK_VIDEO_COUNT:-10}
+      - MAX_CLIP_DURATION=${MAX_CLIP_DURATION:-6}
+      - SCRIPT_FACT_CHECK=${SCRIPT_FACT_CHECK:-true}
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://moneyprinter:moneyprinter@postgres:5432/moneyprinter}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -74,6 +77,9 @@ services:
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - STOCK_VIDEO_COUNT=${STOCK_VIDEO_COUNT:-10}
+      - MAX_CLIP_DURATION=${MAX_CLIP_DURATION:-6}
+      - SCRIPT_FACT_CHECK=${SCRIPT_FACT_CHECK:-true}
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://moneyprinter:moneyprinter@postgres:5432/moneyprinter}
     extra_hosts:
       - "host.docker.internal:host-gateway"

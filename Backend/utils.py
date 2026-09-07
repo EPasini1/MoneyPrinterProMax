@@ -2,6 +2,7 @@ import os
 import sys
 import random
 import logging
+import math
 import shutil
 
 from pathlib import Path
@@ -21,6 +22,32 @@ ENV_FILE = PROJECT_ROOT / ".env"
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_stock_video_count(value: Optional[int] = None) -> int:
+    """Read the per-job clip target, retaining the optional caller override."""
+    raw = os.getenv("STOCK_VIDEO_COUNT", "10") if value is None else value
+    try:
+        count = int(str(raw).strip())
+        if count > 0:
+            return count
+    except (TypeError, ValueError):
+        pass
+    logger.warning("Invalid STOCK_VIDEO_COUNT %r; using 10.", raw)
+    return 10
+
+
+def get_max_clip_duration(value: Optional[float] = None) -> float:
+    """Default invalid durations to six seconds and clamp to [2, 10]."""
+    raw = os.getenv("MAX_CLIP_DURATION", "6") if value is None else value
+    try:
+        duration = float(raw)
+        if math.isfinite(duration):
+            return max(2.0, min(10.0, duration))
+    except (TypeError, ValueError):
+        pass
+    logger.warning("Invalid MAX_CLIP_DURATION %r; using 6 seconds.", raw)
+    return 6.0
 
 
 def clean_dir(path: str) -> None:

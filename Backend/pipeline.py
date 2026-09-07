@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+from typing import Callable, Optional
 
 from apiclient.errors import HttpError
 from moviepy import (
@@ -18,6 +19,7 @@ from gpt import (
     generate_metadata,
     generate_script,
     get_search_terms,
+    verify_and_rewrite_script,
 )
 from logstream import log
 from search import search_for_stock_videos
@@ -30,6 +32,8 @@ from utils import (
     SUBTITLES_DIR,
     TEMP_DIR,
     choose_random_song,
+    get_max_clip_duration,
+    get_stock_video_count,
 )
 from video import combine_videos, generate_subtitles, generate_video, save_video
 from youtube import upload_video
@@ -41,9 +45,9 @@ class PipelineCancelled(Exception):
 
 def run_generation_pipeline(
     data: dict,
-    is_cancelled,
-    on_log,
-    amount_of_stock_videos: int = 5,
+    is_cancelled: Optional[Callable[[], bool]],
+    on_log: Optional[Callable[[str, str], None]],
+    amount_of_stock_videos: Optional[int] = None,
 ) -> str:
     def emit(message: str, level: str = "info") -> None:
         log(message, level)
@@ -59,6 +63,9 @@ def run_generation_pipeline(
     n_threads = data.get("threads") or 2
     subtitles_position = data.get("subtitlesPosition") or "center,bottom"
     text_color = data.get("color") or "#FFFF00"
+    amount_of_stock_videos = get_stock_video_count(amount_of_stock_videos)
+    max_clip_duration = get_max_clip_duration()
+    emit(f"[+] Requested stock clip count: {amount_of_stock_videos}")
 
     # Aspect ratio -> (width, height, Pexels orientation). Default 9:16 vertical.
     aspect_presets = {
@@ -153,37 +160,58 @@ def run_generation_pipeline(
             "Could not generate a script. Try a different model or prompt."
         )
 
+    guard_cancelled()
+    if os.getenv("SCRIPT_FACT_CHECK", "true").strip().lower() in {"true", "1", "yes", "on"}:
+        emit("[+] Reviewing script factual claims with the selected model...")
+        script = verify_and_rewrite_script(data["videoSubject"], script, ai_model, voice)
+        guard_cancelled()
+
     search_terms = get_search_terms(
         data["videoSubject"], amount_of_stock_videos, script, ai_model
     )
+    emit(f"[+] Generated search terms: {search_terms}")
 
-    video_urls = []
+    candidate_groups = []
     it = 15
-    min_dur = 10
 
     for search_term in search_terms:
         guard_cancelled()
-        found_urls = search_for_stock_videos(
-            search_term, os.getenv("PEXELS_API_KEY"), it, min_dur, orientation
-        )
-        for url in found_urls:
-            if url not in video_urls:
-                video_urls.append(url)
-                break
+        candidate_groups.append(search_for_stock_videos(
+            search_term, os.getenv("PEXELS_API_KEY", ""), it, max_clip_duration, orientation
+        ))
 
-    if not video_urls:
-        raise RuntimeError("No videos found to download.")
-
+    # Take one usable source per query per round, then use spare candidates to
+    # fill gaps. A failed download does not consume a slot in the requested count.
     video_paths = []
-    emit(f"[+] Downloading {len(video_urls)} videos...", "info")
+    seen_ids = set()
+    seen_urls = set()
+    emit(f"[+] Downloading up to {amount_of_stock_videos} unique stock videos...")
+    while len(video_paths) < amount_of_stock_videos and any(candidate_groups):
+        for candidates in candidate_groups:
+            if len(video_paths) >= amount_of_stock_videos:
+                break
+            while candidates:
+                guard_cancelled()
+                candidate = candidates.pop(0)
+                if candidate.id in seen_ids or candidate.url in seen_urls:
+                    continue
+                seen_urls.add(candidate.url)
+                try:
+                    saved_video_path = save_video(candidate.url)
+                    video_paths.append(saved_video_path)
+                    seen_ids.add(candidate.id)
+                    break
+                except Exception as err:
+                    emit(f"[-] Could not download Pexels video {candidate.id}: {err}", "warning")
 
-    for video_url in video_urls:
-        guard_cancelled()
-        try:
-            saved_video_path = save_video(video_url)
-            video_paths.append(saved_video_path)
-        except Exception:
-            emit(f"[-] Could not download video: {video_url}", "error")
+    emit(f"[+] Selected clip count: {len(video_paths)}/{amount_of_stock_videos}")
+    if len(video_paths) < amount_of_stock_videos:
+        emit(
+            f"[!] Only {len(video_paths)} of {amount_of_stock_videos} stock clips available. "
+            "Available clips will cycle if needed.", "warning",
+        )
+    if not video_paths:
+        raise RuntimeError("No usable stock videos could be downloaded.")
 
     emit("[+] Videos downloaded!", "success")
     emit("[+] Script generated!", "success")
@@ -231,7 +259,7 @@ def run_generation_pipeline(
         combined_video_path = combine_videos(
             video_paths,
             temp_audio.duration,
-            5,
+            max_clip_duration,
             n_threads or 2,
             target_width,
             target_height,

@@ -247,6 +247,84 @@ def generate_script(
         return None
 
 
+def verify_and_rewrite_script(
+    video_subject: str, script: str, ai_model: str, voice: str
+) -> str:
+    """Review narration with the configured model before it reaches TTS/search."""
+    prompt = f"""
+    Inspect every factual claim in the narration below, including all numbers,
+    comparisons, dates, and causal claims. Remove or rewrite claims that are
+    uncertain, misleading, numerically dubious, or factually incorrect.
+    Do not invent replacement statistics or new facts. Use cautious, accurate
+    wording when a precise claim cannot be supported by your knowledge.
+    Preserve the same approximate length, narration style, language, and number
+    of facts where possible; accuracy takes priority over retaining a false fact.
+    If everything is correct, return the original narration unchanged or an
+    equivalent corrected narration. Output ONLY the corrected narration.
+    No markdown, titles, explanations, fact-check notes, or narrator labels.
+
+    Subject: {video_subject}
+    Voice/language: {voice} (preserve the narration's language)
+    Narration:
+    {script}
+    """
+    corrected = generate_response(prompt, ai_model).strip()
+    if not corrected:
+        raise RuntimeError("Script verification returned empty narration.")
+    return corrected
+
+
+_VAGUE_SEARCH_WORDS = {
+    "fact", "facts", "information", "concept", "concepts", "movement",
+    "idea", "ideas", "knowledge",
+}
+
+
+def _valid_search_term(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    term = " ".join(value.split()).strip('"')
+    words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", term, re.UNICODE)
+    if not 2 <= len(term.split()) <= 5 or not 2 <= len(words) <= 5:
+        return ""
+    if _VAGUE_SEARCH_WORDS.intersection(word.casefold() for word in words):
+        return ""
+    return term
+
+
+def _fallback_search_terms(video_subject: str, script: str) -> List[str]:
+    """Use subject words and script entities, without inventing unrelated visuals."""
+    stop_words = _VAGUE_SEARCH_WORDS | {
+        "a", "an", "the", "of", "about", "and", "in", "on", "for", "to",
+        "is", "are", "what", "how", "why", "top", "interesting", "amazing",
+        "surprising", "incredible", "you", "should", "know",
+    }
+    subject_words = [
+        word for word in re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", video_subject)
+        if word.casefold() not in stop_words and not word.isdigit()
+    ]
+    # Named phrases from narration are safer than arbitrary sentence fragments.
+    entities = re.findall(r"\b[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){1,4}\b", script)
+    bases = [" ".join(subject_words[:4])] if subject_words else []
+    bases.extend(entities)
+    if not bases:
+        bases = [
+            word for word in re.findall(r"[^\W_]+", script)
+            if word.casefold() not in stop_words and not word.isdigit()
+        ][:8]
+
+    terms = list(bases)
+    # These vary the search framing, never add food, people, or other subjects.
+    for base in bases:
+        for framing in ("footage", "view", "close up", "wide view", "details",
+                        "video", "scene", "full view", "stock footage"):
+            terms.append(f"{base} {framing}")
+        for framing in ("footage", "video", "view"):
+            terms.append(f"{framing} {base}")
+        terms.append(f"footage of {base}")
+    return terms
+
+
 def get_search_terms(
     video_subject: str, amount: int, script: str, ai_model: str
 ) -> List[str]:
@@ -264,64 +342,66 @@ def get_search_terms(
         List[str]: The search terms for the video subject.
     """
 
-    # Build prompt
-    prompt = f"""
-    Generate {amount} search terms for stock videos,
-    depending on the subject of a video.
-    Subject: {video_subject}
-
-    The search terms are to be returned as
-    a JSON-Array of strings.
-
-    Each search term should consist of 1-3 words,
-    always add the main subject of the video.
-    
-    YOU MUST ONLY RETURN THE JSON-ARRAY OF STRINGS.
-    YOU MUST NOT RETURN ANYTHING ELSE. 
-    YOU MUST NOT RETURN THE SCRIPT.
-    
-    The search terms must be related to the subject of the video.
-    Here is an example of a JSON-Array of strings:
-    ["search term 1", "search term 2", "search term 3"]
-
-    For context, here is the full text:
-    {script}
-    """
-
-    # Generate search terms
-    response = generate_response(prompt, ai_model)
-    log(response, "info")
-
-    # Parse response into a list of search terms
+    if amount <= 0:
+        return []
     search_terms = []
+    seen = set()
 
-    try:
-        search_terms = json.loads(response)
-        if not isinstance(search_terms, list) or not all(
-            isinstance(term, str) for term in search_terms
-        ):
-            raise ValueError("Response is not a list of strings.")
+    def accept(values: list) -> None:
+        for value in values:
+            term = _valid_search_term(value)
+            if term and term.casefold() not in seen and len(search_terms) < amount:
+                seen.add(term.casefold())
+                search_terms.append(term)
 
-    except (json.JSONDecodeError, ValueError):
-        log("[*] GPT returned an unformatted response. Attempting to clean...", "warning")
+    # Initial generation plus at most three retries, requesting only the deficit.
+    for attempt in range(4):
+        remaining = amount - len(search_terms)
+        prompt = f"""
+        Generate exactly {remaining} new unique search terms for stock-video search.
+        We need {amount} terms in total and still require {remaining} more terms.
+        Already accepted terms (do not repeat, even with different capitalization):
+        {json.dumps(search_terms, ensure_ascii=False)}
 
-        # Attempt to extract JSON array first
-        match = re.search(r"\[[\s\S]*\]", response)
-        if match:
+        Each term MUST contain 2 to 5 words and describe concrete, visually
+        searchable subjects using specific nouns/entities from the script.
+        Use queries suitable for stock-video search, in English where possible.
+        Avoid vague terms: facts, information, concept, movement, idea, knowledge.
+        Avoid metaphorical visuals. Avoid unrelated food, office scenes, generic
+        people, and abstract backgrounds unless actually mentioned in the script.
+        Prefer actual subjects, for example for a Jupiter script: "Jupiter planet",
+        "Great Red Spot", "deep space stars", "space telescope".
+        These are examples only; do not use them for unrelated subjects.
+        Return ONLY a JSON array of strings. No markdown or explanations.
+
+        Subject: {video_subject}
+        Script:
+        {script}
+        """
+        try:
+            response = generate_response(prompt, ai_model)
             try:
-                search_terms = json.loads(match.group())
+                values = json.loads(response)
             except json.JSONDecodeError:
-                search_terms = []
+                match = re.search(r"\[[\s\S]*\]", response)
+                values = json.loads(match.group()) if match else []
+            if isinstance(values, list):
+                accept(values)
+        except (json.JSONDecodeError, RuntimeError) as err:
+            log(f"[!] Search-term generation attempt {attempt + 1}/4 failed: {err}", "warning")
+        if len(search_terms) == amount:
+            break
+        log(
+            f"[!] Accepted {len(search_terms)}/{amount} unique search terms "
+            f"after attempt {attempt + 1}/4.", "warning",
+        )
 
-        # Last-resort fallback: collect quoted strings
-        if not search_terms:
-            search_terms = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', response)
-            search_terms = [term.strip() for term in search_terms if term.strip()]
-
-    # Let user know
+    if len(search_terms) < amount:
+        log("[!] Filling missing search terms with subject/script-derived queries.", "warning")
+        accept(_fallback_search_terms(video_subject, script))
+    if len(search_terms) < amount:
+        log(f"[!] Only {len(search_terms)}/{amount} safe unique queries available.", "warning")
     log(f"\nGenerated {len(search_terms)} search terms: {', '.join(search_terms)}", "info")
-
-    # Return search terms
     return search_terms
 
 

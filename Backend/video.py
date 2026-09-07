@@ -1,4 +1,5 @@
 import os
+import math
 import uuid
 
 import requests
@@ -17,7 +18,7 @@ from moviepy import (
 from dotenv import load_dotenv
 from logstream import log
 from moviepy.video.tools.subtitles import SubtitlesClip
-from utils import ENV_FILE, TEMP_DIR, SUBTITLES_DIR, FONTS_DIR
+from utils import ENV_FILE, TEMP_DIR, SUBTITLES_DIR, FONTS_DIR, get_max_clip_duration
 
 load_dotenv(ENV_FILE)
 
@@ -40,8 +41,19 @@ def save_video(video_url: str, directory: str = str(TEMP_DIR)) -> str:
     destination.mkdir(parents=True, exist_ok=True)
     video_id = uuid.uuid4()
     video_path = destination / f"{video_id}.mp4"
-    with open(video_path, "wb") as f:
-        f.write(requests.get(video_url).content)
+    try:
+        with requests.get(video_url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with video_path.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    file.write(chunk)
+        # Reject HTML/error bodies and broken media before counting this source.
+        with VideoFileClip(str(video_path)) as clip:
+            if not math.isfinite(clip.duration) or clip.duration <= FRAME_EPSILON:
+                raise ValueError("Downloaded stock video has no usable duration.")
+    except Exception:
+        video_path.unlink(missing_ok=True)
+        raise
 
     return str(video_path)
 
@@ -161,8 +173,8 @@ def generate_subtitles(
 
 def combine_videos(
     video_paths: List[str],
-    max_duration: int,
-    max_clip_duration: int,
+    max_duration: float,
+    max_clip_duration: float,
     threads: int,
     target_width: int = 1080,
     target_height: int = 1920,
@@ -172,8 +184,8 @@ def combine_videos(
 
     Args:
         video_paths (List): A list of paths to the videos to combine.
-        max_duration (int): The maximum duration of the combined video.
-        max_clip_duration (int): The maximum duration of each clip.
+        max_duration (float): The maximum duration of the combined video.
+        max_clip_duration (float): The maximum duration of each clip.
         threads (int): The number of threads to use for the video processing.
 
     Returns:
@@ -183,17 +195,18 @@ def combine_videos(
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     combined_video_path = TEMP_DIR / f"{video_id}.mp4"
 
+    # Normalize duplicate paths so every unique source is used before cycling.
+    video_paths = list(dict.fromkeys(str(Path(path).resolve()) for path in video_paths))
     if not video_paths:
         raise ValueError("No source videos were provided for concatenation.")
 
     max_duration = float(max_duration)
-    max_clip_duration = float(max_clip_duration)
-
-    # Required duration of each clip
-    req_dur = max_duration / len(video_paths)
+    if not math.isfinite(max_duration) or max_duration <= FRAME_EPSILON:
+        raise ValueError("Target video duration must be positive and finite.")
+    max_clip_duration = get_max_clip_duration(max_clip_duration)
 
     log("[+] Combining videos...", "info")
-    log(f"[+] Each clip will be maximum {req_dur} seconds long.", "info")
+    log(f"[+] Each clip will be maximum {max_clip_duration} seconds long.", "info")
 
     clips = []
     tot_dur = 0
@@ -212,7 +225,7 @@ def combine_videos(
                 clip.close()
                 continue
 
-            target_duration = min(req_dur, max_clip_duration, remaining)
+            target_duration = min(max_clip_duration, remaining)
             target_duration = min(target_duration, max_safe_source_duration)
 
             if target_duration <= 0:
