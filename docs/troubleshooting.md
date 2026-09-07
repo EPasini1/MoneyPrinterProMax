@@ -28,9 +28,12 @@ Windows example:
 IMAGEMAGICK_BINARY="C:\\Program Files\\ImageMagick-7.1.1-Q16-HDRI\\magick.exe"
 ```
 
-## No stock videos found
+## No usable media found
 
-- Verify `PEXELS_API_KEY` is valid
+- Check the `[Media]` logs for enabled providers and candidate counts.
+- Verify configured Pexels/Pixabay keys, or enable `nasa` without an API key.
+- Enable `ENABLE_IMAGE_FALLBACK=true`; check `MAX_IMAGE_CLIPS` allows stills.
+- Generation needs at least two unique downloadable media items.
 - Try a broader video subject
 - Retry generation; stock results vary by query
 

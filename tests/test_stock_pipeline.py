@@ -10,6 +10,7 @@ import pipeline
 import search
 import video
 from utils import get_max_clip_duration, get_stock_video_count
+from providers.base import MediaCandidate
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -222,14 +223,15 @@ def test_pipeline_reports_empty_candidate_pool_before_tts(monkeypatch) -> None:
         return ["Jupiter planet"]
 
     monkeypatch.setattr(pipeline, "get_search_terms", terms)
-    monkeypatch.setattr(pipeline, "search_for_stock_videos", lambda *args: [])
+    monkeypatch.setattr(pipeline, "search_media_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setenv("MEDIA_PROVIDERS", "nasa")
     logs = []
-    with pytest.raises(RuntimeError, match="No usable stock videos"):
+    with pytest.raises(RuntimeError, match="No usable media"):
         pipeline.run_generation_pipeline(
             {"videoSubject": "Jupiter", "customPrompt": ""}, None,
             lambda message, level: logs.append((message, level)),
         )
-    assert any("Selected clip count: 0/10" in message for message, _ in logs)
+    assert any("Selected 0 unique media items" in message for message, _ in logs)
     assert any("Only 0 of 10" in message and level == "warning" for message, level in logs)
 
 
@@ -271,8 +273,8 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
         assert script == ("Corrected script." if enabled else "Original script.")
         return ["query one", "query two", "query three"]
 
-    def candidate(video_id: int, url: str = "") -> search.StockVideo:
-        return search.StockVideo(video_id, url or f"url-{video_id}", 8, 1080, 1920, "")
+    def candidate(video_id: int, url: str = "") -> MediaCandidate:
+        return MediaCandidate("pexels", "video", str(video_id), "query", url or f"url-{video_id}", "", 1080, 1920, 8)
 
     groups = {
         "query one": [candidate(1), candidate(3), candidate(3, "alternate-after-failure"), candidate(4)],
@@ -280,14 +282,15 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
         "query three": [],
     }
 
-    def stock(query: str, key: str, count: int, duration: float, orientation: str) -> list:
-        assert duration == 7
+    def stock(query: str, orientation: str, subject: str, count: int) -> list:
+        assert get_max_clip_duration() == 7
         assert orientation == "portrait"
         return groups[query]
 
     downloads = []
 
-    def save(url: str) -> str:
+    def save(candidate: MediaCandidate) -> str:
+        url = candidate.download_url
         downloads.append(url)
         if url == "url-3":
             raise RuntimeError("download failed")
@@ -302,8 +305,9 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
 
     monkeypatch.setattr(pipeline, "verify_and_rewrite_script", verify)
     monkeypatch.setattr(pipeline, "get_search_terms", terms)
-    monkeypatch.setattr(pipeline, "search_for_stock_videos", stock)
-    monkeypatch.setattr(pipeline, "save_video", save)
+    monkeypatch.setattr(pipeline, "search_media_candidates", stock)
+    monkeypatch.setenv("MEDIA_PROVIDERS", "nasa")
+    monkeypatch.setattr(pipeline, "download_media", save)
     monkeypatch.setattr(pipeline, "tts", tts)
     logs = []
     with pytest.raises(ReachedTTS):
@@ -313,7 +317,7 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
         )
     assert bool(verification_calls) == enabled
     assert downloads == ["url-1", "url-2", "url-3", "alternate-after-failure"]
-    assert any("Selected clip count: 3/3" in message for message in logs)
+    assert any("Selected 3 unique media items" in message for message in logs)
 
 
 @pytest.mark.parametrize("size", [(90, 160), (160, 90), (100, 100), (80, 100)])

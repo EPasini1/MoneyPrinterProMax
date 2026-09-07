@@ -1,166 +1,83 @@
-import math
+"""Provider routing and deterministic cross-provider media ranking."""
+import os
 import re
-from dataclasses import dataclass
-from typing import List
-from urllib.parse import unquote, urlparse
 
-import requests
+import requests  # Compatibility for callers mocking the legacy Pexels HTTP boundary.
 
 from logstream import log
+from providers.base import MediaCandidate, MediaProvider
+from providers.nasa import NasaProvider
+from providers.pexels import PexelsProvider, StockVideo, search_for_stock_videos
+from providers.pixabay import PixabayProvider
+from providers.ranking import _subject_tokens, _relevance_score
+from utils import get_max_clip_duration
 
 
-@dataclass(frozen=True)
-class StockVideo:
-    id: int
-    url: str
-    duration: float
-    width: int
-    height: int
-    page_url: str
-    relevance: float = 0.0
+SPACE_PATTERN = re.compile(
+    r"\b(?:space|planets?|galaxy|galaxies|universe|nasa|moon|mars|jupiter|saturn|"
+    r"venus|mercury|neptune|uranus|asteroids?|comets?|telescopes?|astronomy|"
+    r"solar\s+system|stars?|nebula|black\s+hole)\b", re.IGNORECASE,
+)
 
 
-def _subject_tokens(text: str) -> set[str]:
-    ignored = {
-        "a", "an", "the", "of", "in", "on", "and", "with", "video", "videos",
-        "footage", "stock", "view", "close", "up", "wide", "full", "details", "scene",
-    }
-    return {
-        word.removesuffix("s")
-        for word in re.findall(r"[^\W\d_]+", text.casefold())
-        if word not in ignored
-    }
+def is_space_topic(subject: str, query: str = "") -> bool:
+    return bool(SPACE_PATTERN.search(subject + " " + query))
 
 
-def _relevance_score(query_tokens: set[str], metadata_tokens: set[str]) -> float:
-    overlap = query_tokens & metadata_tokens
-    if overlap:
-        return 4.0 + 2.0 * len(overlap) / len(query_tokens)
-    if not metadata_tokens or not query_tokens:
-        return 0.0
-
-    # Missing lexical evidence may just mean synonyms. Penalize, never reject.
-    score = -1.0
-    suspicious_categories = (
-        "food rice bowl cooking kitchen chef meal restaurant",
-        "office business meeting desk paperwork corporate",
-        "people person man woman crowd portrait",
-        "abstract background pattern texture",
-    )
-    for category in suspicious_categories:
-        tokens = _subject_tokens(category)
-        if metadata_tokens & tokens and not query_tokens & tokens:
-            score -= 3.0
-    return score
+def get_enabled_providers(video_subject: str = "", query: str = "") -> list[MediaProvider]:
+    names = list(dict.fromkeys(name.strip().lower() for name in
+                             os.getenv("MEDIA_PROVIDERS", "pexels,pixabay,nasa").split(",") if name.strip()))
+    factories = {"pexels": PexelsProvider, "pixabay": PixabayProvider, "nasa": NasaProvider}
+    for name in names:
+        if name not in factories:
+            log(f"[Media] Unknown provider {name!r}; ignored.", "warning")
+    order = ("nasa", "pixabay", "pexels") if is_space_topic(video_subject, query) else ("pexels", "pixabay", "nasa")
+    providers = []
+    for name in order:
+        if name in names:
+            provider = factories[name]()
+            if name == "nasa" or provider.api_key:
+                providers.append(provider)
+    if not providers:
+        raise RuntimeError("No usable media providers. Enable NASA or configure a Pexels/Pixabay API key.")
+    return providers
 
 
-def _rendition_rank(
-    width: int, height: int, target_width: int, target_height: int
-) -> tuple[int, float, int]:
-    """Favor crop-ready 1080p, then 720p, before oversized or tiny files."""
-    pixels = width * height
-    scale = min(width / target_width, height / target_height)
-    reasonable_size = pixels <= target_width * target_height * 1.5
-    if scale >= 1 and reasonable_size:
-        return (0, scale, pixels)
-    if scale >= 2 / 3 and reasonable_size:
-        return (1, -scale, pixels)
-    if scale >= 2 / 3:
-        return (2, pixels, pixels)
-    return (3, -scale, pixels)
+def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_subject: str) -> list[MediaCandidate]:
+    for item in candidates:
+        metadata = " ".join(filter(None, (item.title, item.description)))
+        query_tokens = _subject_tokens(item.query)
+        score = _relevance_score(query_tokens, _subject_tokens(metadata))
+        # Exact multiword names/entities provide stronger evidence than one generic word.
+        phrase = " ".join(re.findall(r"\w+", item.query.casefold()))
+        normalized = " ".join(re.findall(r"\w+", metadata.casefold()))
+        if phrase and re.search(r"\b" + re.escape(phrase) + r"\b", normalized):
+            score += 3
+        if item.width and item.height:
+            actual = "portrait" if item.width < item.height else "landscape" if item.width > item.height else "square"
+            score += 2 if not orientation or actual == orientation else -2
+            score += 1 if min(item.width, item.height) >= 720 else -2
+        if item.duration is not None:
+            score += 1 if item.duration >= get_max_clip_duration() else -1
+        if item.provider == "nasa" and is_space_topic(video_subject, item.query):
+            score += 2
+        item.score = score
+    return sorted(candidates, key=lambda item: -item.score)
 
 
-def search_for_stock_videos(
-    query: str, api_key: str, it: int, min_dur: float, orientation: str = ""
-) -> List[StockVideo]:
-    """Return distinct sources ranked by page-slug relevance and duration.
-
-    Missing overlap lowers ranking without excluding possible synonyms.
-    API order breaks ties between equally relevant, equally suitable candidates.
-    """
-    params = {"query": query, "per_page": it}
-    if orientation:
-        params["orientation"] = orientation
-    try:
-        response = requests.get(
-            "https://api.pexels.com/videos/search",
-            headers={"Authorization": api_key},
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        videos = payload.get("videos", []) if isinstance(payload, dict) else []
-        if not isinstance(videos, list):
-            raise ValueError("Pexels videos field is not a list.")
-    except (requests.RequestException, ValueError) as err:
-        log(f"[!] Pexels search failed for {query!r}: {err}", "warning")
+def search_media_candidates(query: str, orientation: str = "", video_subject: str = "",
+                            max_results: int = 20, search_images: bool = False) -> list[MediaCandidate]:
+    if max_results <= 0:
         return []
-
+    providers = get_enabled_providers(video_subject, query)
+    log(f"[Media] Query: {query!r}", "info")
     candidates = []
-    seen_ids = set()
-    seen_urls = set()
-    query_tokens = _subject_tokens(query)
-    for video in videos:
+    for provider in providers:
         try:
-            video_id = int(video["id"])
-            duration = float(video["duration"])
-            width, height = int(video["width"]), int(video["height"])
-            if video_id in seen_ids or not math.isfinite(duration) or duration <= 0:
-                continue
-            if width <= 0 or height <= 0:
-                continue
-            if orientation == "portrait" and width >= height:
-                continue
-            if orientation == "landscape" and width <= height:
-                continue
-            if orientation == "square" and width != height:
-                continue
-
-            page_url = str(video.get("url") or "")
-            slug = unquote(urlparse(page_url).path.rstrip("/").rsplit("/", 1)[-1])
-            metadata_tokens = _subject_tokens(slug)
-            relevance = _relevance_score(query_tokens, metadata_tokens)
-
-            # Infer a standard target from source orientation without changing the API.
-            if width < height:
-                target_width, target_height = 1080, 1920
-            elif width > height:
-                target_width, target_height = 1920, 1080
-            else:
-                target_width, target_height = 1080, 1080
-            files = []
-            for rendition in video.get("video_files", []):
-                if not isinstance(rendition, dict):
-                    continue
-                link = rendition.get("link")
-                if not isinstance(link, str) or urlparse(link).scheme not in {"http", "https"}:
-                    continue
-                if rendition.get("file_type") != "video/mp4":
-                    continue
-                file_width = int(rendition.get("width") or 0)
-                file_height = int(rendition.get("height") or 0)
-                if file_width > 0 and file_height > 0:
-                    files.append((
-                        _rendition_rank(file_width, file_height, target_width, target_height),
-                        link,
-                    ))
-            if not files:
-                continue
-            _, link = min(files, key=lambda item: item[0])
-            if link in seen_urls:
-                continue
-            candidates.append(StockVideo(
-                video_id, link, duration, width, height, page_url, relevance,
-            ))
-            seen_ids.add(video_id)
-            seen_urls.add(link)
-        except (KeyError, TypeError, ValueError, AttributeError) as err:
-            log(f"[!] Skipping malformed Pexels candidate for {query!r}: {err}", "warning")
-
-    # Prefer corroborated subjects and long-enough clips; preserve API order on ties.
-    candidates.sort(key=lambda item: (
-        -item.relevance, item.duration < min_dur,
-    ))
-    log(f"\t=> {query!r} found {len(candidates)} usable videos", "info")
-    return candidates
+            results = provider.search(query, orientation, max_results, search_images=search_images)
+            log(f"[Media] {provider.name.title()}: {len(results)} candidates", "info")
+            candidates.extend(results)
+        except Exception as err:
+            log(f"[Media] {provider.name.title()} failed ({type(err).__name__}); trying remaining providers.", "warning")
+    # Keep alternate renditions available after a failed download; selection deduplicates successes.
+    return rank_candidates(candidates, orientation, video_subject)

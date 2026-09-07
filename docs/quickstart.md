@@ -49,7 +49,8 @@ Copy-Item .env.example .env
 Set required values in `.env`:
 
 - `TIKTOK_SESSION_ID`
-- `PEXELS_API_KEY`
+- Optional: `PEXELS_API_KEY` and/or `PIXABAY_API_KEY` for stock footage. NASA works without a key.
+- Keep at least one usable provider in `MEDIA_PROVIDERS` (see [Configuration](configuration.md)).
 
 See [Configuration](configuration.md) for all variables.
 

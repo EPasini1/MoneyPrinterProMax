@@ -6,12 +6,19 @@ import requests
 import srt_equalizer
 import assemblyai as aai
 
-from typing import List
+from typing import Callable, List
 from pathlib import Path
+from urllib.parse import urlparse
+
+import numpy as np
+from PIL import Image, ImageOps
+from providers.base import MediaCandidate, timeout_setting
 from moviepy import (
     AudioFileClip,
     CompositeVideoClip,
+    ImageClip,
     TextClip,
+    VideoClip,
     VideoFileClip,
     concatenate_videoclips,
 )
@@ -26,36 +33,78 @@ ASSEMBLY_AI_API_KEY = os.getenv("ASSEMBLY_AI_API_KEY")
 FRAME_EPSILON = 1 / 120
 
 
-def save_video(video_url: str, directory: str = str(TEMP_DIR)) -> str:
-    """
-    Saves a video from a given URL and returns the path to the video.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-    Args:
-        video_url (str): The URL of the video to save.
-        directory (str): The path of the temporary directory to save the video to
 
-    Returns:
-        str: The path to the saved video.
-    """
-    destination = Path(directory).expanduser().resolve()
+def download_media(candidate: MediaCandidate, directory: str | None = None) -> str:
+    """Stream and validate a source before it consumes a selection slot."""
+    if candidate.media_type not in {"video", "image"}:
+        raise ValueError("Unsupported media type.")
+    destination = Path(directory) if directory is not None else TEMP_DIR
     destination.mkdir(parents=True, exist_ok=True)
-    video_id = uuid.uuid4()
-    video_path = destination / f"{video_id}.mp4"
+    extension = Path(urlparse(candidate.download_url).path).suffix.lower()
+    if candidate.media_type == "video":
+        extension = ".mp4"
+    elif extension not in IMAGE_EXTENSIONS:
+        extension = ".jpg"
+    path = destination / f"{uuid.uuid4()}{extension}"
     try:
-        with requests.get(video_url, stream=True, timeout=60) as response:
+        with requests.get(candidate.download_url, stream=True,
+                          timeout=timeout_setting("MEDIA_DOWNLOAD_TIMEOUT", 60),
+                          headers={"User-Agent": "MoneyPrinterProMax/2.0 (media downloader)"}) as response:
             response.raise_for_status()
-            with video_path.open("wb") as file:
+            with path.open("wb") as file:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    file.write(chunk)
-        # Reject HTML/error bodies and broken media before counting this source.
-        with VideoFileClip(str(video_path)) as clip:
-            if not math.isfinite(clip.duration) or clip.duration <= FRAME_EPSILON:
-                raise ValueError("Downloaded stock video has no usable duration.")
+                    if chunk:
+                        file.write(chunk)
+        if candidate.media_type == "video":
+            with VideoFileClip(str(path)) as clip:
+                if not math.isfinite(clip.duration) or clip.duration <= FRAME_EPSILON:
+                    raise ValueError("Downloaded stock video has no usable duration.")
+        else:
+            with Image.open(path) as image:
+                image.verify()
+            # Decode once to reject truncated images before counting the source.
+            with Image.open(path) as image:
+                image.load()
+                actual_extension = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp"}.get(image.format)
+            if not actual_extension:
+                raise ValueError("Unsupported downloaded image format.")
+            if path.suffix != actual_extension:
+                path = path.rename(path.with_suffix(actual_extension))
     except Exception:
-        video_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
         raise
+    return str(path)
 
-    return str(video_path)
+
+def save_video(video_url: str, directory: str = str(TEMP_DIR)) -> str:
+    """Compatibility wrapper for Phase 1 video-only callers."""
+    return download_media(MediaCandidate("pexels", "video", "", "", video_url,
+                                         None, None, None, None), directory)
+
+
+def create_image_clip(image_path: str, duration: float, target_width: int,
+                      target_height: int) -> VideoClip:
+    """Center crop once, then zoom 6% using a constant-sized output frame."""
+    if not math.isfinite(duration) or duration <= 0 or min(target_width, target_height) <= 0:
+        raise ValueError("Image scene duration and dimensions must be positive.")
+    with Image.open(image_path) as original:
+        # JPEG decoding can downsample before allocating the full image.
+        original.draft("RGB", (target_width, target_height))
+        fitted = ImageOps.fit(ImageOps.exif_transpose(original).convert("RGB"),
+                              (target_width, target_height), method=Image.Resampling.LANCZOS)
+    base = ImageClip(np.asarray(fitted)).with_duration(duration).with_fps(30)
+
+    def zoom(get_frame: Callable, time: float) -> np.ndarray:
+        factor = 1 + 0.06 * min(1, max(0, time / duration))
+        width, height = target_width / factor, target_height / factor
+        left, top = (target_width - width) / 2, (target_height - height) / 2
+        frame = Image.fromarray(get_frame(0))
+        return np.asarray(frame.resize((target_width, target_height), Image.Resampling.BICUBIC,
+                                       box=(left, top, left + width, top + height)))
+
+    return base.transform(zoom).with_duration(duration).with_fps(30)
 
 
 def __generate_subtitles_assemblyai(audio_path: str, voice: str) -> str:
@@ -209,77 +258,57 @@ def combine_videos(
     log(f"[+] Each clip will be maximum {max_clip_duration} seconds long.", "info")
 
     clips = []
-    tot_dur = 0
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
-    while tot_dur < (max_duration - FRAME_EPSILON):
-        progressed = False
-        for video_path in video_paths:
-            remaining = max_duration - tot_dur
-            if remaining <= FRAME_EPSILON:
-                break
-
-            clip = VideoFileClip(video_path)
-            clip = clip.without_audio()
-            max_safe_source_duration = clip.duration - FRAME_EPSILON
-            if max_safe_source_duration <= 0:
-                clip.close()
-                continue
-
-            target_duration = min(max_clip_duration, remaining)
-            target_duration = min(target_duration, max_safe_source_duration)
-
-            if target_duration <= 0:
-                clip.close()
-                continue
-
-            if target_duration < clip.duration:
-                clip = clip.subclipped(0, target_duration)
-            clip = clip.with_fps(30)
-
-            # Not all videos are same size, so we crop them to the target
-            # aspect ratio (center crop) then resize to the target resolution.
-            target_ratio = target_width / target_height
-            if round((clip.w / clip.h), 4) < target_ratio:
-                clip = clip.cropped(
-                    width=clip.w,
-                    height=round(clip.w / target_ratio),
-                    x_center=clip.w / 2,
-                    y_center=clip.h / 2,
-                )
-            else:
-                clip = clip.cropped(
-                    width=round(target_ratio * clip.h),
-                    height=clip.h,
-                    x_center=clip.w / 2,
-                    y_center=clip.h / 2,
-                )
-            clip = clip.resized(new_size=(target_width, target_height))
-
-            clips.append(clip)
-            tot_dur += clip.duration
-            progressed = True
-
-        if not progressed:
-            raise RuntimeError("Could not reach target duration from source videos.")
-
-    if not clips:
-        raise RuntimeError("No valid clips were produced for concatenation.")
-
-    final_clip = concatenate_videoclips(clips, method="compose")
-    final_clip = final_clip.with_fps(30).with_duration(max_duration)
+    sources = {}
+    final_clip = None
+    tot_dur = 0.0
+    last_path = None
     try:
-        final_clip.write_videofile(
-            str(combined_video_path),
-            threads=threads,
-            fps=30,
-            codec="libx264",
-            preset="medium",
-            audio=False,
-        )
+        while tot_dur < max_duration - 1e-9:
+            progressed = False
+            for media_path in video_paths:
+                remaining = max_duration - tot_dur
+                if remaining <= 1e-9:
+                    break
+                if media_path == last_path:
+                    continue
+                if media_path not in sources:
+                    if Path(media_path).suffix.lower() in IMAGE_EXTENSIONS:
+                        sources[media_path] = create_image_clip(media_path, max_clip_duration, target_width, target_height)
+                    else:
+                        sources[media_path] = VideoFileClip(media_path)
+                source = sources[media_path]
+                is_image = Path(media_path).suffix.lower() in IMAGE_EXTENSIONS
+                safe_duration = source.duration if is_image else source.duration - FRAME_EPSILON
+                if not math.isfinite(safe_duration) or safe_duration <= 0:
+                    continue
+                target_duration = min(max_clip_duration, remaining, safe_duration)
+                clip = source.without_audio().subclipped(0, target_duration).with_fps(30)
+                if not is_image or tuple(clip.size) != (target_width, target_height):
+                    target_ratio = target_width / target_height
+                    if clip.w / clip.h < target_ratio:
+                        clip = clip.cropped(width=clip.w, height=round(clip.w / target_ratio),
+                                            x_center=clip.w / 2, y_center=clip.h / 2)
+                    else:
+                        clip = clip.cropped(width=round(target_ratio * clip.h), height=clip.h,
+                                            x_center=clip.w / 2, y_center=clip.h / 2)
+                    clip = clip.resized(new_size=(target_width, target_height))
+                clips.append(clip)
+                tot_dur += target_duration
+                last_path = media_path
+                progressed = True
+            if not progressed:
+                raise RuntimeError("Could not reach target duration without immediate source repetition.")
+        final_clip = concatenate_videoclips(clips, method="chain")
+        final_clip = final_clip.with_fps(30).with_duration(max_duration)
+        final_clip.write_videofile(str(combined_video_path), threads=threads, fps=30,
+                                   codec="libx264", preset="medium", audio=False)
     finally:
-        final_clip.close()
+        if final_clip is not None:
+            final_clip.close()
         for clip in clips:
             clip.close()
+        for source in sources.values():
+            source.close()
 
     return str(combined_video_path)
 

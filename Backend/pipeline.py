@@ -22,7 +22,8 @@ from gpt import (
     verify_and_rewrite_script,
 )
 from logstream import log
-from search import search_for_stock_videos
+from providers.base import MediaCandidate, image_fallback_enabled, max_image_clips
+from search import get_enabled_providers, is_space_topic, search_media_candidates
 from tiktokvoice import tts
 from utils import (
     BASE_DIR,
@@ -35,12 +36,102 @@ from utils import (
     get_max_clip_duration,
     get_stock_video_count,
 )
-from video import combine_videos, generate_subtitles, generate_video, save_video
+from video import combine_videos, download_media, generate_subtitles, generate_video
 from youtube import upload_video
 
 
 class PipelineCancelled(Exception):
     pass
+
+
+def select_media(
+    search_terms: list[str], video_subject: str, orientation: str, target: int,
+    guard_cancelled: Callable[[], None], emit: Callable[[str, str], None],
+) -> list[str]:
+    providers = get_enabled_providers(video_subject)
+    emit("[Media] Providers enabled: " + ", ".join(provider.name for provider in providers), "info")
+    emit(f"[Media] Target scenes: {target}", "info")
+    image_limit = max_image_clips() if image_fallback_enabled() else 0
+    paths: list[str] = []
+    seen_ids: set[tuple[str, str]] = set()
+    seen_urls: set[str] = set()
+    attempted_urls: set[str] = set()
+    images = 0
+
+    def take(candidate: MediaCandidate) -> bool:
+        nonlocal images
+        guard_cancelled()
+        identity = (candidate.provider, candidate.source_id)
+        if identity in seen_ids or candidate.download_url in seen_urls or candidate.download_url in attempted_urls:
+            return False
+        if candidate.media_type == "image" and images >= image_limit:
+            return False
+        attempted_urls.add(candidate.download_url)
+        try:
+            path = download_media(candidate)
+        except Exception as err:
+            emit(f"[Media] Download failed: {candidate.provider} / {candidate.source_id} ({type(err).__name__}).", "warning")
+            return False
+        paths.append(path)
+        seen_ids.add(identity)
+        seen_urls.add(candidate.download_url)
+        images += candidate.media_type == "image"
+        emit(f"[Media] Selected: {candidate.provider} / {candidate.media_type} / {candidate.source_id}", "info")
+        return True
+
+    groups = []
+    for term in search_terms:
+        guard_cancelled()
+        groups.append(search_media_candidates(term, orientation, video_subject, 20))
+
+    def fill(allow_images: bool) -> None:
+        # Round-robin across queries preserves visual variety before using spares.
+        while len(paths) < target:
+            progressed = False
+            for group in groups:
+                if len(paths) >= target:
+                    break
+                videos = [candidate for candidate in group if candidate.media_type == "video"]
+                choices = list(group) if allow_images else videos
+                if not allow_images and image_limit > images:
+                    strong_images = [candidate for candidate in group
+                                     if candidate.media_type == "image" and candidate.provider == "nasa"
+                                     and is_space_topic(video_subject, candidate.query) and candidate.score >= 8]
+                    if not videos or max(candidate.score for candidate in videos) < 2:
+                        choices = strong_images + videos
+                for candidate in choices:
+                    group.remove(candidate)
+                    if take(candidate):
+                        progressed = True
+                        break
+            if not progressed:
+                break
+
+    fill(False)
+    if len(paths) < target:
+        guard_cancelled()
+        # Exactly one broader search, including when generated terms found nothing.
+        groups.append(search_media_candidates(video_subject, orientation, video_subject, 20))
+        fill(False)
+    if len(paths) < target and images < image_limit:
+        # Reuse NASA images already resolved during the normal pass first.
+        fill(True)
+        for term in dict.fromkeys([*search_terms, video_subject]):
+            if len(paths) >= target or images >= image_limit:
+                break
+            guard_cancelled()
+            groups.append(search_media_candidates(term, orientation, video_subject, 20, search_images=True))
+            fill(True)
+    emit(f"[Media] Selected {len(paths)} unique media items", "info")
+    emit(f"[Media] Videos: {len(paths) - images}", "info")
+    emit(f"[Media] Images: {images}", "info")
+    if len(paths) < target:
+        emit(f"[Media] Only {len(paths)} of {target} media items available; sources will cycle if needed.", "warning")
+    if not paths:
+        raise RuntimeError("No usable media could be downloaded from enabled providers.")
+    if len(paths) < 2:
+        raise RuntimeError("At least 2 unique media items are required; only one usable item was found.")
+    return paths
 
 
 def run_generation_pipeline(
@@ -171,49 +262,11 @@ def run_generation_pipeline(
     )
     emit(f"[+] Generated search terms: {search_terms}")
 
-    candidate_groups = []
-    it = 15
+    video_paths = select_media(
+        search_terms, data["videoSubject"], orientation, amount_of_stock_videos,
+        guard_cancelled, emit,
+    )
 
-    for search_term in search_terms:
-        guard_cancelled()
-        candidate_groups.append(search_for_stock_videos(
-            search_term, os.getenv("PEXELS_API_KEY", ""), it, max_clip_duration, orientation
-        ))
-
-    # Take one usable source per query per round, then use spare candidates to
-    # fill gaps. A failed download does not consume a slot in the requested count.
-    video_paths = []
-    seen_ids = set()
-    seen_urls = set()
-    emit(f"[+] Downloading up to {amount_of_stock_videos} unique stock videos...")
-    while len(video_paths) < amount_of_stock_videos and any(candidate_groups):
-        for candidates in candidate_groups:
-            if len(video_paths) >= amount_of_stock_videos:
-                break
-            while candidates:
-                guard_cancelled()
-                candidate = candidates.pop(0)
-                if candidate.id in seen_ids or candidate.url in seen_urls:
-                    continue
-                seen_urls.add(candidate.url)
-                try:
-                    saved_video_path = save_video(candidate.url)
-                    video_paths.append(saved_video_path)
-                    seen_ids.add(candidate.id)
-                    break
-                except Exception as err:
-                    emit(f"[-] Could not download Pexels video {candidate.id}: {err}", "warning")
-
-    emit(f"[+] Selected clip count: {len(video_paths)}/{amount_of_stock_videos}")
-    if len(video_paths) < amount_of_stock_videos:
-        emit(
-            f"[!] Only {len(video_paths)} of {amount_of_stock_videos} stock clips available. "
-            "Available clips will cycle if needed.", "warning",
-        )
-    if not video_paths:
-        raise RuntimeError("No usable stock videos could be downloaded.")
-
-    emit("[+] Videos downloaded!", "success")
     emit("[+] Script generated!", "success")
 
     guard_cancelled()

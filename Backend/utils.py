@@ -149,7 +149,7 @@ def check_env_vars() -> None:
         SystemExit: If any required environment variables are missing.
     """
     try:
-        required_vars = ["PEXELS_API_KEY", "TIKTOK_SESSION_ID"]
+        required_vars = ["TIKTOK_SESSION_ID"]
         missing_vars = []
         for var in required_vars:
             value = os.getenv(var)
