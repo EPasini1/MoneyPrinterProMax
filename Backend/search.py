@@ -10,8 +10,9 @@ from providers.nasa import NasaProvider
 from providers.pexels import PexelsProvider, StockVideo, search_for_stock_videos
 from providers.pixabay import PixabayProvider
 from providers.ranking import (
-    _nasa_program_penalty, _subject_anchor_score, _subject_tokens,
-    _query_context_evidence, _relevance_score, _title_evidence_score,
+    _candidate_subject_lock, _nasa_program_penalty, _query_compounds,
+    _subject_anchor_score, _subject_tokens, _query_context_evidence,
+    _relevance_score, _title_evidence_score, locked_subject_tokens,
 )
 from utils import get_max_clip_duration
 
@@ -47,16 +48,22 @@ def get_enabled_providers(video_subject: str = "", query: str = "") -> list[Medi
 
 
 def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_subject: str) -> list[MediaCandidate]:
-    subject_tokens = _subject_tokens(video_subject)
+    subject_tokens = locked_subject_tokens(video_subject)
+    subject_compounds = _query_compounds(video_subject)
     for item in candidates:
         metadata = "\n".join(filter(None, (item.title, item.description)))
         query_tokens = _subject_tokens(item.query)
         metadata_tokens = _subject_tokens(metadata)
+        metadata_compounds = _query_compounds(metadata)
         score = _relevance_score(query_tokens, metadata_tokens)
         score += _subject_anchor_score(subject_tokens, metadata_tokens)
         score += _title_evidence_score(item.title or "", query_tokens, subject_tokens)
         context_score, sufficient_evidence = _query_context_evidence(item.query, video_subject, metadata)
         score += context_score
+        # Candidate Lock: metadata alone must prove the subject; the query it
+        # was found under is never accepted as evidence (see providers/ranking.py).
+        candidate_lock_ok = _candidate_subject_lock(subject_tokens, subject_compounds,
+                                                    metadata_tokens, metadata_compounds)
         if item.provider == "nasa" and item.media_type == "video":
             score -= _nasa_program_penalty(item.title or "")
         # Exact multiword names/entities provide stronger evidence than one generic word.
@@ -74,7 +81,7 @@ def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_su
                 and metadata_tokens & (subject_tokens | query_tokens)):
             score += 5
         # A technical/provider bonus cannot rescue one ambiguous query component.
-        item.score = score if sufficient_evidence else min(score, -4.0)
+        item.score = score if (sufficient_evidence and candidate_lock_ok) else min(score, -4.0)
     return sorted(candidates, key=lambda item: -item.score)
 
 

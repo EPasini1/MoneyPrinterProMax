@@ -6,6 +6,7 @@ from ollama import Client, ResponseError
 from dotenv import load_dotenv
 from fact_sources import retrieve_fact_sources
 from logstream import log
+from providers.ranking import GENERIC_FRAMING_WORDS, locked_subject_tokens
 from typing import Callable, Tuple, List, Optional
 from utils import ENV_FILE
 
@@ -379,19 +380,24 @@ def _valid_search_term(value: object) -> str:
     return term
 
 
+_NAMED_ENTITY_PATTERN = re.compile(r"\b[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){1,4}\b")
+
+
+def _is_script_named_entity(term: str, script: str) -> bool:
+    """A Title-Case multiword phrase actually present in the script (e.g. "Great
+    Red Spot"): a named feature of the subject, not an invented tangent."""
+    return bool(_NAMED_ENTITY_PATTERN.fullmatch(term)) and term.casefold() in script.casefold()
+
+
 def _fallback_search_terms(video_subject: str, script: str) -> List[str]:
     """Use subject words and script entities, without inventing unrelated visuals."""
-    stop_words = _VAGUE_SEARCH_WORDS | {
-        "a", "an", "the", "of", "about", "and", "in", "on", "for", "to",
-        "is", "are", "what", "how", "why", "top", "interesting", "amazing",
-        "surprising", "incredible", "you", "should", "know",
-    }
+    stop_words = _VAGUE_SEARCH_WORDS | GENERIC_FRAMING_WORDS
     subject_words = [
         word for word in re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", video_subject)
         if word.casefold() not in stop_words and not word.isdigit()
     ]
     # Named phrases from narration are safer than arbitrary sentence fragments.
-    entities = re.findall(r"\b[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){1,4}\b", script)
+    entities = _NAMED_ENTITY_PATTERN.findall(script)
     bases = [" ".join(subject_words[:4])] if subject_words else []
     bases.extend(entities)
     if not bases:
@@ -433,13 +439,22 @@ def get_search_terms(
         return []
     search_terms = []
     seen = set()
+    # Query Lock: every accepted term must carry the primary subject or a
+    # curated alias forward; an empty lock (fully abstract subject) is a no-op.
+    lock_tokens = locked_subject_tokens(video_subject)
 
     def accept(values: list) -> None:
         for value in values:
             term = _valid_search_term(value)
-            if term and term.casefold() not in seen and len(search_terms) < amount:
-                seen.add(term.casefold())
-                search_terms.append(term)
+            if not term or term.casefold() in seen or len(search_terms) >= amount:
+                continue
+            if lock_tokens and not locked_subject_tokens(term) & lock_tokens:
+                # A named feature from the script (e.g. "Great Red Spot") is a
+                # legitimate anchor even without literally repeating the subject.
+                if not _is_script_named_entity(term, script):
+                    continue
+            seen.add(term.casefold())
+            search_terms.append(term)
 
     # Initial generation plus at most three retries, requesting only the deficit.
     for attempt in range(4):
@@ -456,6 +471,9 @@ def get_search_terms(
         Avoid vague terms: facts, information, concept, movement, idea, knowledge.
         Avoid metaphorical visuals. Avoid unrelated food, office scenes, generic
         people, and abstract backgrounds unless actually mentioned in the script.
+        Every term MUST include the video's main subject noun (see Subject below)
+        or a close synonym of it, so unrelated visuals are never generated. Vary
+        the framing instead: close-up, wide shot, habitat, texture, behavior, motion.
         Prefer actual subjects, for example for a Jupiter script: "Jupiter planet",
         "Great Red Spot", "deep space stars", "space telescope".
         These are examples only; do not use them for unrelated subjects.

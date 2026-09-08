@@ -47,7 +47,7 @@ def test_search_terms_retry_only_deficit_and_validate(monkeypatch) -> None:
         '["Jupiter planet", "jupiter PLANET", "facts information", "stars", 7]',
         '```json\n["Jupiter planet", "Great Red Spot"]\n```',
         '{"terms": ["not an array"]}',
-        '["deep space stars", "space telescope", "extra valid term"]',
+        '["Jupiter deep space", "Jupiter space telescope", "extra valid term"]',
     ])
 
     def respond(prompt: str, model: str) -> str:
@@ -56,7 +56,7 @@ def test_search_terms_retry_only_deficit_and_validate(monkeypatch) -> None:
 
     monkeypatch.setattr(gpt, "generate_response", respond)
     terms = gpt.get_search_terms("Jupiter", 4, "Jupiter has a Great Red Spot.", "test")
-    assert terms == ["Jupiter planet", "Great Red Spot", "deep space stars", "space telescope"]
+    assert terms == ["Jupiter planet", "Great Red Spot", "Jupiter deep space", "Jupiter space telescope"]
     assert len(prompts) == 4
     assert "exactly 3 new" in prompts[1]
     assert '["Jupiter planet"]' in prompts[1]

@@ -7,41 +7,85 @@ SPACE_ENTITIES = {
 }
 
 
+# Irregular Latin plurals that show up in trivia topics but don't fit the
+# regular "-us"/"-uses" pattern handled in _normalize_token.
+_IRREGULAR_PLURALS = {
+    "octopi": "octopus", "cacti": "cactus", "fungi": "fungus", "nuclei": "nucleus",
+}
+
+
 def _normalize_token(word: str) -> str:
     """Small English plural normalization, shared by tokens and compound phrases."""
     if word in SPACE_ENTITIES | {"kubernetes", "series", "species", "physics", "gas", "analysis"}:
         return word
     if word in {"volcanoes", "potatoes", "tomatoes"}:
         return word[:-2]
+    if word in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[word]
     if len(word) > 4 and word.endswith("ies"):
         return word[:-3] + "y"
     if word.endswith(("ches", "shes", "sses", "xes", "zzes")):
         return word[:-2]
+    # "-us" nouns pluralize as "-uses" (octopus/virus/walrus/campus/bus); an
+    # already-singular "-us" word must not have its trailing "s" stripped.
+    if word.endswith("uses"):
+        return word[:-2]
+    if word.endswith("us"):
+        return word
     return word if word.endswith("ss") else word.removesuffix("s")
 
 
+# Generic clickbait/framing words that never describe a visual subject. Shared
+# with gpt.py so query generation and ranking cannot drift out of sync again
+# (e.g. "weird" previously leaked through here and falsely anchored candidates).
+GENERIC_FRAMING_WORDS = {
+    "a", "an", "the", "of", "in", "on", "and", "with", "video", "videos",
+    "footage", "stock", "view", "close", "up", "wide", "full", "details", "scene",
+    "fact", "facts", "strange", "strangest", "interesting", "amazing", "surprising",
+    "thing", "things", "about", "top", "best", "detail", "scenes", "etc",
+    "for", "to", "is", "are", "what", "how", "why", "you", "should", "know",
+    "incredible", "information",
+    "weird", "weirdest", "odd", "bizarre", "crazy", "wild", "unusual",
+    "mysterious", "shocking", "unbelievable",
+    "work", "working", "actually", "explain", "explained", "guide",
+    "tip", "trick", "tutorial", "learn", "learning", "easy", "simple",
+    "way", "reason",
+}
+
+
 def _subject_tokens(text: str) -> set[str]:
-    ignored = {
-        "a", "an", "the", "of", "in", "on", "and", "with", "video", "videos",
-        "footage", "stock", "view", "close", "up", "wide", "full", "details", "scene",
-        "fact", "facts", "strange", "interesting", "amazing", "surprising",
-        "thing", "things", "about", "top", "best", "detail", "scenes", "etc",
-        "for", "to", "is", "are", "what", "how", "why", "you", "should", "know",
-        "incredible", "information",
-        "work", "working", "actually", "explain", "explained", "guide",
-        "tip", "trick", "tutorial", "learn", "learning", "easy", "simple",
-        "way", "reason",
-    }
     tokens = set()
     for word in re.findall(r"[^\W\d_]+", text.casefold()):
-        if word in ignored:
+        if word in GENERIC_FRAMING_WORDS:
             continue
         # Preserve names ending in s, and filter again after singularization:
         # e.g. works -> work must not become a subject anchor.
         normalized = _normalize_token(word)
-        if normalized and normalized not in ignored:
+        if normalized and normalized not in GENERIC_FRAMING_WORDS:
             tokens.add(normalized)
     return tokens
+
+
+# Curated aliases for locked subjects whose common synonym differs from the
+# literal subject noun. Extend as new problem topics are discovered.
+SUBJECT_ALIASES: dict[str, set[str]] = {
+    "octopus": {"cephalopod"},
+}
+
+
+def locked_subject_tokens(text: str) -> set[str]:
+    """Canonical subject tokens, expanded to full curated alias groups.
+
+    A subject phrased with only the alias (e.g. "cephalopod") must still
+    resolve to the same locked group as the canonical word.
+    """
+    tokens = _subject_tokens(text)
+    expanded = set(tokens)
+    for canonical, aliases in SUBJECT_ALIASES.items():
+        group = {canonical} | aliases
+        if tokens & group:
+            expanded |= group
+    return expanded
 
 
 # These components have common meanings outside their compound's domain. They
@@ -49,6 +93,27 @@ def _subject_tokens(text: str) -> set[str]:
 AMBIGUOUS_COMPONENTS = {
     "plate", "chamber", "network", "intelligence", "artificial", "black", "hole", "shield", "ash",
 }
+
+
+def _candidate_is_gated(subject_lock_tokens: set[str]) -> bool:
+    """Only curated/space subjects get the hard Candidate Lock; others stay soft."""
+    return bool(subject_lock_tokens & (SPACE_ENTITIES | set(SUBJECT_ALIASES)))
+
+
+def _candidate_subject_lock(
+    subject_lock_tokens: set[str], subject_compounds: set[tuple[str, str]],
+    metadata_tokens: set[str], metadata_compounds: set[tuple[str, str]],
+) -> bool:
+    """A candidate's OWN metadata must prove the subject; its query is never consulted.
+
+    Shared DOMAIN_CONTEXT domain is deliberately NOT a pass condition here: it
+    remains a soft signal inside _query_context_evidence only.
+    """
+    if not subject_lock_tokens or not _candidate_is_gated(subject_lock_tokens):
+        return True
+    if (subject_lock_tokens & metadata_tokens) - AMBIGUOUS_COMPONENTS:
+        return True
+    return bool(subject_compounds & metadata_compounds)
 
 # Extensible domain evidence, rather than a subject-specific exclusion list.
 # Ambiguous components are deliberately absent from these distinctive markers.
