@@ -5,14 +5,14 @@ import re
 import requests  # Compatibility for callers mocking the legacy Pexels HTTP boundary.
 
 from logstream import log
-from providers.base import MediaCandidate, MediaProvider
+from providers.base import MediaCandidate, MediaProvider, media_min_score
 from providers.nasa import NasaProvider
 from providers.pexels import PexelsProvider, StockVideo, search_for_stock_videos
 from providers.pixabay import PixabayProvider
 from providers.ranking import (
-    _candidate_subject_lock, _nasa_program_penalty, _query_compounds,
-    _subject_anchor_score, _subject_tokens, _query_context_evidence,
-    _relevance_score, _title_evidence_score, locked_subject_tokens,
+    _candidate_subject_lock, _has_curated_feature, _nasa_program_penalty,
+    _query_compounds, _subject_anchor_score, _subject_tokens,
+    _query_context_evidence, _relevance_score, _title_evidence_score, locked_subject_tokens,
 )
 from utils import get_max_clip_duration
 
@@ -50,38 +50,58 @@ def get_enabled_providers(video_subject: str = "", query: str = "") -> list[Medi
 def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_subject: str) -> list[MediaCandidate]:
     subject_tokens = locked_subject_tokens(video_subject)
     subject_compounds = _query_compounds(video_subject)
+    minimum_score = media_min_score()
     for item in candidates:
         metadata = "\n".join(filter(None, (item.title, item.description)))
         query_tokens = _subject_tokens(item.query)
         metadata_tokens = _subject_tokens(metadata)
         metadata_compounds = _query_compounds(metadata)
-        score = _relevance_score(query_tokens, metadata_tokens)
-        score += _subject_anchor_score(subject_tokens, metadata_tokens)
-        score += _title_evidence_score(item.title or "", query_tokens, subject_tokens)
-        context_score, sufficient_evidence = _query_context_evidence(item.query, video_subject, metadata)
-        score += context_score
+        # Computed once and reused everywhere a curated feature counts as evidence.
+        feature_match = _has_curated_feature(subject_tokens, metadata)
+        # Semantic relevance to the subject/query/scene - technical and provider
+        # bonuses below are kept out of this total on purpose (see gate below).
+        semantic_score = _relevance_score(query_tokens, metadata_tokens)
+        semantic_score += _subject_anchor_score(subject_tokens, metadata_tokens, feature_match)
+        semantic_score += _title_evidence_score(item.title or "", query_tokens, subject_tokens)
+        context_score, sufficient_evidence = _query_context_evidence(item.query, video_subject, metadata, feature_match)
+        semantic_score += context_score
         # Candidate Lock: metadata alone must prove the subject; the query it
         # was found under is never accepted as evidence (see providers/ranking.py).
         candidate_lock_ok = _candidate_subject_lock(subject_tokens, subject_compounds,
-                                                    metadata_tokens, metadata_compounds)
+                                                    metadata_tokens, metadata_compounds, feature_match)
         if item.provider == "nasa" and item.media_type == "video":
-            score -= _nasa_program_penalty(item.title or "")
+            semantic_score -= _nasa_program_penalty(item.title or "")
         # Exact multiword names/entities provide stronger evidence than one generic word.
         phrase = " ".join(re.findall(r"\w+", item.query.casefold()))
         normalized = " ".join(re.findall(r"\w+", metadata.casefold()))
         if phrase and re.search(r"\b" + re.escape(phrase) + r"\b", normalized):
-            score += 3
+            semantic_score += 3
+
+        # Technical/provider quality only ranks among semantically eligible
+        # candidates; it must never be the reason one becomes selectable.
+        technical_score = 0.0
         if item.width and item.height:
             actual = "portrait" if item.width < item.height else "landscape" if item.width > item.height else "square"
-            score += 2 if not orientation or actual == orientation else -2
-            score += 1 if min(item.width, item.height) >= 720 else -2
+            technical_score += 2 if not orientation or actual == orientation else -2
+            technical_score += 1 if min(item.width, item.height) >= 720 else -2
         if item.duration is not None:
-            score += 1 if item.duration >= get_max_clip_duration() else -1
+            technical_score += 1 if item.duration >= get_max_clip_duration() else -1
         if (item.provider == "nasa" and is_space_topic(video_subject, item.query)
                 and metadata_tokens & (subject_tokens | query_tokens)):
-            score += 5
-        # A technical/provider bonus cannot rescue one ambiguous query component.
-        item.score = score if (sufficient_evidence and candidate_lock_ok) else min(score, -4.0)
+            technical_score += 5
+
+        eligible = sufficient_evidence and candidate_lock_ok
+        if eligible and feature_match:
+            # A curated feature alone (no genuine token/compound/domain anchor)
+            # must still clear real query/scene relevance, not just Candidate
+            # Lock, before technical bonuses are allowed to count.
+            _, sufficient_without_feature = _query_context_evidence(item.query, video_subject, metadata)
+            locked_without_feature = _candidate_subject_lock(subject_tokens, subject_compounds,
+                                                              metadata_tokens, metadata_compounds)
+            feature_only_rescue = not (sufficient_without_feature and locked_without_feature)
+            eligible = not feature_only_rescue or semantic_score >= minimum_score
+        # Technical/provider bonuses cannot rescue a semantically ineligible candidate.
+        item.score = semantic_score + technical_score if eligible else min(semantic_score, -4.0)
     return sorted(candidates, key=lambda item: -item.score)
 
 

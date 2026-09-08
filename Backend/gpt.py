@@ -6,7 +6,7 @@ from ollama import Client, ResponseError
 from dotenv import load_dotenv
 from fact_sources import retrieve_fact_sources
 from logstream import log
-from providers.ranking import GENERIC_FRAMING_WORDS, locked_subject_tokens
+from providers.ranking import GENERIC_FRAMING_WORDS, _has_curated_feature, locked_subject_tokens
 from typing import Callable, Tuple, List, Optional
 from utils import ENV_FILE
 
@@ -449,9 +449,10 @@ def get_search_terms(
             if not term or term.casefold() in seen or len(search_terms) >= amount:
                 continue
             if lock_tokens and not locked_subject_tokens(term) & lock_tokens:
-                # A named feature from the script (e.g. "Great Red Spot") is a
-                # legitimate anchor even without literally repeating the subject.
-                if not _is_script_named_entity(term, script):
+                # A curated subject feature (e.g. "Great Red Spot") or a named
+                # feature actually present in the script is a legitimate anchor
+                # even without literally repeating the subject.
+                if not (_has_curated_feature(lock_tokens, term) or _is_script_named_entity(term, script)):
                     continue
             seen.add(term.casefold())
             search_terms.append(term)

@@ -72,6 +72,14 @@ SUBJECT_ALIASES: dict[str, set[str]] = {
     "octopus": {"cephalopod"},
 }
 
+# Curated, narrow named visual sub-features of a locked subject (e.g. a named
+# storm system or landmark). Deliberately NOT derived from DOMAIN_CONTEXT or
+# arbitrary script text - each entry is a specific, visually identifiable
+# phrase, kept small so it cannot weaken Subject Lock into a domain match.
+SUBJECT_FEATURES: dict[str, set[str]] = {
+    "jupiter": {"great red spot"},
+}
+
 
 def locked_subject_tokens(text: str) -> set[str]:
     """Canonical subject tokens, expanded to full curated alias groups.
@@ -100,20 +108,41 @@ def _candidate_is_gated(subject_lock_tokens: set[str]) -> bool:
     return bool(subject_lock_tokens & (SPACE_ENTITIES | set(SUBJECT_ALIASES)))
 
 
+def _has_curated_feature(subject_lock_tokens: set[str], text: str) -> bool:
+    """A curated named sub-feature (e.g. Jupiter's Great Red Spot) is
+    independently sufficient evidence, without weakening the lock to any
+    script phrase or DOMAIN_CONTEXT match. Reused by both lock layers so a
+    query built from a curated feature and a candidate described by it agree.
+    """
+    if not text:
+        return False
+    normalized = " ".join(re.findall(r"[^\W_]+", text.casefold()))
+    for canonical in subject_lock_tokens:
+        for feature in SUBJECT_FEATURES.get(canonical, ()):
+            if re.search(r"\b" + re.escape(feature) + r"\b", normalized):
+                return True
+    return False
+
+
 def _candidate_subject_lock(
     subject_lock_tokens: set[str], subject_compounds: set[tuple[str, str]],
     metadata_tokens: set[str], metadata_compounds: set[tuple[str, str]],
+    feature_match: bool = False,
 ) -> bool:
     """A candidate's OWN metadata must prove the subject; its query is never consulted.
 
     Shared DOMAIN_CONTEXT domain is deliberately NOT a pass condition here: it
-    remains a soft signal inside _query_context_evidence only.
+    remains a soft signal inside _query_context_evidence only. `feature_match`
+    is computed once per candidate via _has_curated_feature() and threaded
+    through every consumer, so there is a single canonical feature check.
     """
     if not subject_lock_tokens or not _candidate_is_gated(subject_lock_tokens):
         return True
     if (subject_lock_tokens & metadata_tokens) - AMBIGUOUS_COMPONENTS:
         return True
-    return bool(subject_compounds & metadata_compounds)
+    if subject_compounds & metadata_compounds:
+        return True
+    return feature_match
 
 # Extensible domain evidence, rather than a subject-specific exclusion list.
 # Ambiguous components are deliberately absent from these distinctive markers.
@@ -148,14 +177,14 @@ def _context_domains(tokens: set[str], compounds: set[tuple[str, str]]) -> set[s
             if words & tokens or compounds & DOMAIN_COMPOUNDS.get(name, set())}
 
 
-def _query_context_evidence(query: str, subject: str, metadata: str) -> tuple[float, bool]:
+def _query_context_evidence(query: str, subject: str, metadata: str, feature_match: bool = False) -> tuple[float, bool]:
     """Return coverage/context score and whether lexical evidence clears the guard.
 
     Quality/provider bonuses must never rescue a candidate with weak evidence.
     Shared distinctive domain terms allow related footage without exact wording.
     """
     query_tokens = _subject_tokens(query)
-    subject_tokens = _subject_tokens(subject)
+    subject_tokens = locked_subject_tokens(subject)
     metadata_tokens = _subject_tokens(metadata)
     overlap = query_tokens & metadata_tokens
     coverage = len(overlap) / len(query_tokens) if query_tokens else 0.0
@@ -167,7 +196,8 @@ def _query_context_evidence(query: str, subject: str, metadata: str) -> tuple[fl
     candidate_domains = _context_domains(metadata_tokens, metadata_compounds)
     shared_domain = bool(expected_domains & candidate_domains)
     direct_anchor = (bool((subject_tokens & metadata_tokens) - AMBIGUOUS_COMPONENTS)
-                     or bool(subject_compounds & metadata_compounds))
+                     or bool(subject_compounds & metadata_compounds)
+                     or feature_match)
     strong_anchor = direct_anchor or shared_domain
 
     score = 6.0 * coverage + min(12.0, 6.0 * len(compound_matches))
@@ -193,17 +223,28 @@ def _query_context_evidence(query: str, subject: str, metadata: str) -> tuple[fl
     return score, enough_coverage or strong_anchor
 
 
-def _subject_anchor_score(subject_tokens: set[str], metadata_tokens: set[str]) -> float:
-    """Weight the video's subject above query framing and technical quality."""
+def _subject_anchor_score(subject_tokens: set[str], metadata_tokens: set[str], feature_match: bool = False) -> float:
+    """Weight the video's subject above query framing and technical quality.
+
+    A curated feature (feature_match) proves the subject is present without
+    the literal name, so it clears the usual penalties, but it is treated as
+    neutral rather than a bonus: actual query/scene relevance still decides
+    whether the candidate clears MEDIA_MIN_SCORE.
+    """
     if not subject_tokens:
         return 0.0
     overlap = (subject_tokens & metadata_tokens) - AMBIGUOUS_COMPONENTS
     requested_entities = subject_tokens & SPACE_ENTITIES
-    score = 8.0 + 4.0 * len(overlap) / len(subject_tokens) if overlap else -3.0
+    if overlap:
+        score = 8.0 + 4.0 * len(overlap) / len(subject_tokens)
+    elif feature_match:
+        score = 0.0
+    else:
+        score = -3.0
     if requested_entities:
         if requested_entities & metadata_tokens:
             score += 10.0
-        else:
+        elif not feature_match:
             score -= 10.0
             if metadata_tokens & SPACE_ENTITIES:
                 score -= 16.0
