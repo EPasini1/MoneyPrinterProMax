@@ -64,7 +64,7 @@
         min-height: 100vh;
         line-height: 1.55;
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: center;
       }
 
@@ -84,10 +84,24 @@
 
       /* ===== LAYOUT ===== */
       .container {
-        max-width: 660px;
+        width: 100%;
+        max-width: 1560px;
         margin: 0 auto;
-        padding: 72px 24px 48px;
+        padding: 40px 28px 32px;
       }
+
+      .workspace { display: grid; gap: 24px; align-items: start; }
+      .workspace > *, .form-group { min-width: 0; }
+      @media (min-width: 1080px) {
+        .workspace { grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.3fr); }
+        .output-panel { position: sticky; top: 24px; }
+      }
+
+      button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+        outline: 3px solid #22c55e;
+        outline-offset: 3px;
+      }
+      .toggle input:focus-visible + .toggle-track { outline: 3px solid var(--accent); outline-offset: 3px; }
 
       /* ===== HEADER ===== */
       .header {
@@ -216,8 +230,9 @@
 
       .form-grid {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 16px;
+        align-items: end;
       }
 
       /* ===== COLOR DOT ===== */
@@ -249,58 +264,36 @@
         margin: 24px 0;
       }
 
-      /* ===== ADVANCED TOGGLE ===== */
-      .advanced-toggle {
+      /* ===== GENERATION SETTINGS ===== */
+      .settings-header {
         display: flex;
         align-items: center;
-        gap: 8px;
-        width: 100%;
-        padding: 0;
-        background: none;
-        border: none;
-        cursor: pointer;
-        font-family: var(--font-body);
-        font-size: 0.85rem;
-        font-weight: 600;
-        color: var(--text-2);
-        transition: color 0.2s;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px 16px;
       }
-
-      .advanced-toggle:hover {
+      .settings-heading {
+        font-size: 1rem;
+        font-weight: 600;
         color: var(--text);
       }
-
-      .advanced-toggle.open {
-        color: var(--accent);
+      .settings-reset {
+        border: 0;
+        background: transparent;
+        color: var(--text-2);
+        font: inherit;
+        font-size: 0.8rem;
+        padding: 6px 0;
+        cursor: pointer;
+        text-decoration: underline;
+        text-underline-offset: 3px;
       }
-
-      .chevron {
-        width: 14px;
-        height: 14px;
-        transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
-        flex-shrink: 0;
+      .settings-reset:hover { color: var(--text); }
+      .settings-reset:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 4px;
       }
-
-      .advanced-toggle.open .chevron {
-        transform: rotate(180deg);
-      }
-
-      /* ===== ADVANCED PANEL ===== */
-      .advanced-panel {
-        display: grid;
-        grid-template-rows: 0fr;
-        transition: grid-template-rows 0.4s cubic-bezier(0.22, 1, 0.36, 1);
-      }
-
-      .advanced-panel.open {
-        grid-template-rows: 1fr;
-      }
-
-      .advanced-inner {
-        overflow: hidden;
-      }
-
-      .advanced-content {
+      .settings-content {
         display: flex;
         flex-direction: column;
         gap: 18px;
@@ -316,6 +309,7 @@
       }
 
       .toggle {
+        position: relative;
         display: flex;
         align-items: center;
         gap: 9px;
@@ -326,9 +320,14 @@
       .toggle input {
         position: absolute;
         opacity: 0;
-        width: 0;
-        height: 0;
-        pointer-events: none;
+        left: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 36px;
+        height: 24px;
+        pointer-events: auto;
+        cursor: pointer;
+        z-index: 1;
       }
 
       .toggle-track {
@@ -374,14 +373,14 @@
 
       /* ===== STATUS AREA ===== */
       .status-area {
-        display: none;
+        display: flex;
         flex-direction: column;
         gap: 10px;
         padding: 22px 18px 16px;
         background: var(--accent-light);
         border: 1px solid rgba(22, 163, 74, 0.12);
         border-radius: var(--radius);
-        margin-top: 12px;
+        margin-bottom: 14px;
       }
 
       .status-area.active {
@@ -405,17 +404,20 @@
       }
 
       .status-text {
-        font-size: 0.8rem;
-        font-weight: 500;
-        color: var(--accent);
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--text);
       }
+      .status-meta { font-size: 0.75rem; color: var(--text-2); display: flex; gap: 16px; flex-wrap: wrap; }
+      .progress-track { display: none; }
+      .status-area.active .progress-track { display: block; }
 
       /* ===== LOG VIEWER ===== */
       .log-viewer {
-        display: none;
+        display: flex;
         flex-direction: column;
-        margin-top: 10px;
-        border-radius: 8px;
+        min-width: 0;
+        border-radius: 14px;
         overflow: hidden;
         border: 1px solid rgba(28, 25, 23, 0.08);
       }
@@ -428,7 +430,9 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 8px 12px;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 16px;
         background: #292524;
         border-bottom: 1px solid #3f3a36;
       }
@@ -436,36 +440,43 @@
       .log-viewer-title {
         font-size: 0.7rem;
         font-weight: 600;
-        color: #a8a29e;
+        color: #e7e5e4;
         text-transform: uppercase;
         letter-spacing: 0.05em;
       }
-
-      .log-viewer-clear {
-        background: none;
-        border: none;
-        color: #78716c;
-        font-size: 1rem;
-        cursor: pointer;
-        padding: 0 4px;
-        line-height: 1;
-        transition: color 0.15s;
-      }
-
-      .log-viewer-clear:hover {
-        color: #d6d3cd;
-      }
+      .log-heading, .log-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .log-controls { font-size: 0.75rem; color: #e7e5e4; }
+      .log-controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+      .log-controls input { accent-color: #22c55e; }
+      .log-control { font: inherit; background: #3f3a36; color: #fafaf9; border: 1px solid #57534e;
+        border-radius: 6px; padding: 7px 9px; cursor: pointer; }
+      .log-control:hover { background: #57534e; }
+      .log-badge { color: #d6d3d1; font-size: 0.65rem; font-weight: 700; border: 1px solid currentColor;
+        border-radius: 20px; padding: 3px 8px; }
+      .log-badge[data-state="running"], .log-badge[data-state="completed"] { color: #86efac; }
+      .log-badge[data-state="queued"], .log-badge[data-state="cancelled"] { color: #fcd34d; }
+      .log-badge[data-state="failed"] { color: #fca5a5; }
+      .log-summary { padding: 12px 16px; color: #bbf7d0; background: #163125;
+        font-size: 0.8rem; border-bottom: 1px solid #3f3a36; max-height: 25vh; overflow-y: auto; }
+      .log-summary[data-state="failed"] { color: #fecaca; background: #3c2020; }
+      .log-summary[data-state="cancelled"] { color: #fde68a; background: #3c301e; }
+      .log-summary p { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 
       .log-viewer-body {
         background: #1c1917;
-        max-height: 240px;
+        height: 62vh;
+        min-height: min(500px, 65vh);
+        max-height: 75vh;
         overflow-y: auto;
-        padding: 10px 12px;
+        padding: 16px;
         font-family: "SF Mono", "Cascadia Code", "Fira Code", "Consolas",
           monospace;
         font-size: 0.75rem;
         line-height: 1.6;
       }
+      .log-viewer-body:empty::before { content: "Ready when you are. Start a generation to see live output here.";
+        display: block; max-width: 340px; margin: 48px auto; text-align: center; color: #a8a29e; }
+      .log-viewer-body { scrollbar-gutter: stable; overflow-wrap: anywhere; }
 
       .log-viewer-body::-webkit-scrollbar {
         width: 6px;
@@ -485,13 +496,29 @@
       }
 
       .log-entry {
-        display: flex;
+        display: grid;
+        grid-template-columns: auto auto minmax(0, 1fr);
         gap: 8px;
-        padding: 1px 0;
+        padding: 6px 4px;
       }
+      .log-level { font-size: 0.65rem; min-width: 7ch; font-weight: 700; }
+      .log-entry[data-level="error"] { background: #3c2020; border-left: 3px solid #f87171; font-weight: 600; }
+      .log-entry[data-level="success"] .log-level { color: #86efac; }
+      .log-entry[data-level="warning"] .log-level { color: #fcd34d; }
+      .log-entry[data-level="error"] .log-level { color: #fca5a5; }
+      .log-entry[data-level="info"] .log-level { color: #d6d3d1; }
+
+      body.logs-expanded { overflow: hidden; }
+      body.logs-expanded::before { content: ""; position: fixed; inset: 0; background: #0009; z-index: 90; }
+      .output-panel:has(.expanded) { z-index: 100; }
+      .output-panel:has(.expanded) .status-area { visibility: hidden; }
+      .log-viewer.expanded { position: fixed; z-index: 100; left: 50%; top: 7.5vh;
+        transform: translateX(-50%); width: 92vw; max-width: 1440px; height: 85vh; height: 85dvh; }
+      .log-viewer.expanded .log-viewer-body { flex: 1; height: auto; min-height: 0; max-height: none; }
+      .log-viewer.expanded .log-viewer-header, .log-summary { flex-shrink: 0; }
 
       .log-time {
-        color: #57534e;
+        color: #a8a29e;
         flex-shrink: 0;
       }
 
@@ -514,7 +541,7 @@
       }
 
       .log-msg.log-info {
-        color: #a8a29e;
+        color: #d6d3d1;
       }
 
       /* ===== BUTTONS ===== */
@@ -658,6 +685,9 @@
 
       .toast-msg {
         flex: 1;
+        min-width: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
         line-height: 1.4;
       }
 
@@ -712,6 +742,10 @@
         .form-grid {
           grid-template-columns: 1fr;
         }
+        .log-entry { grid-template-columns: auto minmax(0, 1fr); }
+        .log-msg { grid-column: 1 / -1; }
+        .log-viewer-body { min-height: 300px; height: 55vh; padding: 12px; }
+        .log-viewer.expanded { width: 96vw; top: 3vh; height: 94vh; height: 94dvh; }
 
         .toggles-row {
           flex-direction: column;
@@ -740,7 +774,8 @@
         <p class="subtitle">Automate YouTube Shorts with AI</p>
       </header>
 
-      <div class="card">
+      <div class="workspace">
+      <div class="card" id="generationForm">
         <!-- Subject -->
         <div class="form-group">
           <label for="videoSubject" class="label">Video Subject</label>
@@ -755,30 +790,12 @@
 
         <div class="divider"></div>
 
-        <!-- Advanced Options Toggle -->
-        <button
-          type="button"
-          id="advancedOptionsToggle"
-          class="advanced-toggle"
-        >
-          <svg
-            class="chevron"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M4 6l4 4 4-4" />
-          </svg>
-          <span>Advanced Options</span>
-        </button>
-
-        <!-- Advanced Panel -->
-        <div id="advancedOptions" class="advanced-panel">
-          <div class="advanced-inner">
-            <div class="advanced-content">
+        <section aria-labelledby="settingsHeading">
+          <div class="settings-header">
+            <h2 id="settingsHeading" class="settings-heading">Generation Settings</h2>
+            <button type="button" id="resetSettingsButton" class="settings-reset">Reset settings</button>
+          </div>
+          <div class="settings-content">
               <!-- AI Model + Voice -->
               <div class="form-grid">
                 <div class="form-group">
@@ -811,7 +828,7 @@
                       <option value="en_us_001">Female 1</option>
                       <option value="en_us_002">Female 2</option>
                       <option value="en_us_006">Male 1</option>
-                      <option value="en_us_007">Male 2</option>
+                      <option value="en_us_007" selected>Male 2</option>
                       <option value="en_us_009">Male 3</option>
                       <option value="en_us_010">Male 4</option>
                     </optgroup>
@@ -866,7 +883,7 @@
                 </div>
               </div>
 
-              <!-- Aspect Ratio -->
+              <!-- Aspect Ratio + Subtitles Position -->
               <div class="form-grid">
                 <div class="form-group">
                   <label for="aspectRatio" class="label">Aspect Ratio</label>
@@ -877,10 +894,6 @@
                     <option value="4:5">4:5 &middot; Portrait (Feed)</option>
                   </select>
                 </div>
-              </div>
-
-              <!-- Subtitles Position + Color -->
-              <div class="form-grid">
                 <div class="form-group">
                   <label for="subtitlesPosition" class="label"
                     >Subtitles Position</label
@@ -903,7 +916,10 @@
                     <option value="right,bottom">Right &middot; Bottom</option>
                   </select>
                 </div>
+              </div>
 
+              <!-- Subtitle Color + Threads -->
+              <div class="form-grid">
                 <div class="form-group">
                   <label for="subtitlesColor" class="label"
                     >Subtitle Color</label
@@ -924,10 +940,6 @@
                     </select>
                   </div>
                 </div>
-              </div>
-
-              <!-- Threads + Paragraphs -->
-              <div class="form-grid">
                 <div class="form-group">
                   <label for="threads" class="label">Threads</label>
                   <input
@@ -940,7 +952,10 @@
                     max="100"
                   />
                 </div>
+              </div>
 
+              <!-- Paragraphs + Duration -->
+              <div class="form-grid">
                 <div class="form-group">
                   <label for="paragraphNumber" class="label">Paragraphs</label>
                   <input
@@ -953,15 +968,11 @@
                     max="100"
                   />
                 </div>
-              </div>
-
-              <!-- Minimum Duration -->
-              <div class="form-grid">
                 <div class="form-group">
                   <label for="minDuration" class="label"
-                    >Min Duration
+                    >Min Duration (s)
                     <span class="label-hint"
-                      >&mdash; seconds (0 = use Paragraphs)</span
+                      >&mdash; 0 uses Paragraphs</span
                     ></label
                   >
                   <input
@@ -1044,24 +1055,8 @@
                   <span class="toggle-text">Reuse Choices</span>
                 </label>
               </div>
-            </div>
           </div>
-        </div>
-
-        <!-- Status Area -->
-        <div class="status-area" id="statusArea">
-          <div class="progress-track">
-            <div class="progress-fill"></div>
-          </div>
-          <span class="status-text">Generating your video&hellip;</span>
-          <div class="log-viewer" id="logViewer">
-            <div class="log-viewer-header">
-              <span class="log-viewer-title">Live Output</span>
-              <button type="button" class="log-viewer-clear" id="logClearBtn">&times;</button>
-            </div>
-            <div class="log-viewer-body" id="logViewerBody"></div>
-          </div>
-        </div>
+        </section>
 
         <!-- Actions -->
         <div class="actions">
@@ -1083,6 +1078,31 @@
         </div>
       </div>
 
+      <section class="output-panel" aria-label="Generation output">
+        <div class="status-area" id="statusArea">
+          <div class="status-text" id="generationStatus" role="status">Ready to generate</div>
+          <div class="status-meta"><span id="jobLabel">No active job</span><span id="elapsedTime">Elapsed 00:00</span></div>
+          <div class="progress-track" aria-hidden="true"><div class="progress-fill"></div></div>
+        </div>
+        <section class="log-viewer" id="logViewer" aria-labelledby="logTitle">
+          <div class="log-viewer-header">
+            <div class="log-heading"><h2 class="log-viewer-title" id="logTitle">Live Output</h2>
+              <span class="log-badge" id="jobStateBadge" data-state="idle">READY</span></div>
+            <div class="log-controls">
+              <label><input type="checkbox" id="logAutoScroll" checked /> Auto-scroll</label>
+              <button type="button" class="log-control" id="logClearBtn">Clear</button>
+              <button type="button" class="log-control" id="logCopyBtn">Copy logs</button>
+              <button type="button" class="log-control" id="logExpandBtn" aria-expanded="false" aria-controls="logViewerBody">Expand</button>
+            </div>
+          </div>
+          <div class="log-summary hidden" id="jobSummary" role="status">
+            <strong id="jobSummaryTitle"></strong><p id="jobSummaryMessage"></p>
+          </div>
+          <div class="log-viewer-body" id="logViewerBody" role="log" aria-label="Generation logs" aria-live="off" tabindex="0"></div>
+        </section>
+      </section>
+      </div>
+
       <footer class="footer">
         <p>
           Made with &hearts; by
@@ -1093,7 +1113,7 @@
       </footer>
     </main>
 
-    <div id="toastContainer" class="toast-container"></div>
-    <script src="app.js"></script>
+    <div id="toastContainer" class="toast-container" role="status"></div>
+    <script src="app.js?v=settings-v1"></script>
   </body>
 </html>

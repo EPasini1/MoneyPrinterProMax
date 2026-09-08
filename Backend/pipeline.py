@@ -1,7 +1,9 @@
+import math
 import os
 import re
 import shutil
 import subprocess
+from itertools import groupby
 from typing import Callable, Optional
 
 from apiclient.errors import HttpError
@@ -22,8 +24,8 @@ from gpt import (
     verify_and_rewrite_script,
 )
 from logstream import log
-from providers.base import MediaCandidate, image_fallback_enabled, max_image_clips
-from search import get_enabled_providers, is_space_topic, search_media_candidates
+from providers.base import MediaCandidate, image_fallback_enabled, max_image_clips, media_min_score
+from search import get_enabled_providers, search_media_candidates
 from tiktokvoice import tts
 from utils import (
     BASE_DIR,
@@ -44,6 +46,18 @@ class PipelineCancelled(Exception):
     pass
 
 
+MAX_MEDIA_SCENES = 120
+
+
+def media_requirement(audio_duration: float, max_clip_duration: float, configured_count: int) -> tuple[int, int]:
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise RuntimeError("Narration audio must have a positive finite duration.")
+    if not math.isfinite(max_clip_duration) or max_clip_duration <= 0:
+        raise RuntimeError("Maximum clip duration must be positive and finite.")
+    required = math.ceil(audio_duration / max_clip_duration)
+    return required, min(MAX_MEDIA_SCENES, max(2, configured_count, required))
+
+
 def select_media(
     search_terms: list[str], video_subject: str, orientation: str, target: int,
     guard_cancelled: Callable[[], None], emit: Callable[[str, str], None],
@@ -52,10 +66,13 @@ def select_media(
     emit("[Media] Providers enabled: " + ", ".join(provider.name for provider in providers), "info")
     emit(f"[Media] Target scenes: {target}", "info")
     image_limit = max_image_clips() if image_fallback_enabled() else 0
+    minimum_score = media_min_score()
     paths: list[str] = []
     seen_ids: set[tuple[str, str]] = set()
     seen_urls: set[str] = set()
     attempted_urls: set[str] = set()
+    rejected: set[tuple[str, str, str]] = set()
+    represented_queries: set[str] = set()
     images = 0
 
     def take(candidate: MediaCandidate) -> bool:
@@ -69,6 +86,8 @@ def select_media(
         attempted_urls.add(candidate.download_url)
         try:
             path = download_media(candidate)
+        except PipelineCancelled:
+            raise
         except Exception as err:
             emit(f"[Media] Download failed: {candidate.provider} / {candidate.source_id} ({type(err).__name__}).", "warning")
             return False
@@ -76,55 +95,52 @@ def select_media(
         seen_ids.add(identity)
         seen_urls.add(candidate.download_url)
         images += candidate.media_type == "image"
-        emit(f"[Media] Selected: {candidate.provider} / {candidate.media_type} / {candidate.source_id}", "info")
+        represented_queries.add(candidate.query)
+        emit(f"[Media] Selected: {candidate.provider} / {candidate.media_type} / {candidate.source_id} / "
+             f"score={candidate.score:.2f} / query={candidate.query!r}", "info")
         return True
 
-    groups = []
+    def fill(candidates: list[MediaCandidate]) -> None:
+        eligible = []
+        for candidate in candidates:
+            guard_cancelled()
+            if not math.isfinite(candidate.score) or candidate.score < minimum_score:
+                rejected.add((candidate.provider, candidate.source_id, candidate.download_url))
+            else:
+                eligible.append(candidate)
+        # Diversity only breaks exact score ties; a higher score always wins.
+        # Stable input order breaks remaining ties, preserving provider/source
+        # order. Only successful downloads count as represented queries.
+        ordered = sorted(eligible, key=lambda item: -item.score)
+        for _, group in groupby(ordered, key=lambda item: item.score):
+            if len(paths) >= target:
+                break
+            tied = list(group)
+            while tied and len(paths) < target:
+                index = next((i for i, item in enumerate(tied)
+                              if item.query not in represented_queries), 0)
+                take(tied.pop(index))
+
+    candidates = []
     for term in search_terms:
         guard_cancelled()
-        groups.append(search_media_candidates(term, orientation, video_subject, 20))
-
-    def fill(allow_images: bool) -> None:
-        # Round-robin across queries preserves visual variety before using spares.
-        while len(paths) < target:
-            progressed = False
-            for group in groups:
-                if len(paths) >= target:
-                    break
-                videos = [candidate for candidate in group if candidate.media_type == "video"]
-                choices = list(group) if allow_images else videos
-                if not allow_images and image_limit > images:
-                    strong_images = [candidate for candidate in group
-                                     if candidate.media_type == "image" and candidate.provider == "nasa"
-                                     and is_space_topic(video_subject, candidate.query) and candidate.score >= 8]
-                    if not videos or max(candidate.score for candidate in videos) < 2:
-                        choices = strong_images + videos
-                for candidate in choices:
-                    group.remove(candidate)
-                    if take(candidate):
-                        progressed = True
-                        break
-            if not progressed:
-                break
-
-    fill(False)
+        candidates.extend(search_media_candidates(term, orientation, video_subject, 20))
+    fill(candidates)
     if len(paths) < target:
         guard_cancelled()
         # Exactly one broader search, including when generated terms found nothing.
-        groups.append(search_media_candidates(video_subject, orientation, video_subject, 20))
-        fill(False)
+        fill(search_media_candidates(video_subject, orientation, video_subject, 20))
     if len(paths) < target and images < image_limit:
-        # Reuse NASA images already resolved during the normal pass first.
-        fill(True)
+        # Pixabay photos are requested only after the normal and broad passes.
+        candidates = []
         for term in dict.fromkeys([*search_terms, video_subject]):
-            if len(paths) >= target or images >= image_limit:
-                break
             guard_cancelled()
-            groups.append(search_media_candidates(term, orientation, video_subject, 20, search_images=True))
-            fill(True)
+            candidates.extend(search_media_candidates(term, orientation, video_subject, 20, search_images=True))
+        fill(candidates)
     emit(f"[Media] Selected {len(paths)} unique media items", "info")
     emit(f"[Media] Videos: {len(paths) - images}", "info")
     emit(f"[Media] Images: {images}", "info")
+    emit(f"[Media] Candidates rejected below threshold ({minimum_score:g}): {len(rejected)}", "info")
     if len(paths) < target:
         emit(f"[Media] Only {len(paths)} of {target} media items available; sources will cycle if needed.", "warning")
     if not paths:
@@ -254,18 +270,8 @@ def run_generation_pipeline(
     guard_cancelled()
     if os.getenv("SCRIPT_FACT_CHECK", "true").strip().lower() in {"true", "1", "yes", "on"}:
         emit("[+] Reviewing script factual claims with the selected model...")
-        script = verify_and_rewrite_script(data["videoSubject"], script, ai_model, voice)
+        script = verify_and_rewrite_script(data["videoSubject"], script, ai_model, voice, emit)
         guard_cancelled()
-
-    search_terms = get_search_terms(
-        data["videoSubject"], amount_of_stock_videos, script, ai_model
-    )
-    emit(f"[+] Generated search terms: {search_terms}")
-
-    video_paths = select_media(
-        search_terms, data["videoSubject"], orientation, amount_of_stock_videos,
-        guard_cancelled, emit,
-    )
 
     emit("[+] Script generated!", "success")
 
@@ -275,21 +281,41 @@ def run_generation_pipeline(
     sentences = list(filter(lambda x: x != "", sentences))
     paths = []
 
-    for sentence in sentences:
-        guard_cancelled()
-        current_tts_path = str(TEMP_DIR / f"{uuid4()}.mp3")
-        tts(sentence, voice, filename=current_tts_path)
-        audio_clip = AudioFileClip(current_tts_path)
-        paths.append(audio_clip)
-
-    final_audio = concatenate_audioclips(paths)
+    final_audio = None
     tts_path = str(TEMP_DIR / f"{uuid4()}.mp3")
     try:
+        for sentence in sentences:
+            guard_cancelled()
+            current_tts_path = str(TEMP_DIR / f"{uuid4()}.mp3")
+            tts(sentence, voice, filename=current_tts_path)
+            paths.append(AudioFileClip(current_tts_path))
+        final_audio = concatenate_audioclips(paths)
         final_audio.write_audiofile(tts_path)
     finally:
-        final_audio.close()
+        if final_audio is not None:
+            final_audio.close()
         for audio_clip in paths:
             audio_clip.close()
+
+    guard_cancelled()
+    temp_audio = AudioFileClip(tts_path)
+    try:
+        audio_duration = temp_audio.duration
+    finally:
+        temp_audio.close()
+    required, media_target = media_requirement(audio_duration, max_clip_duration, amount_of_stock_videos)
+    emit(f"[Media] Audio duration: {audio_duration:.1f}s")
+    emit(f"[Media] Unique scenes required at {max_clip_duration:g}s max: {required}")
+    if max(required, amount_of_stock_videos) > MAX_MEDIA_SCENES:
+        emit(f"[Media] Target capped at {MAX_MEDIA_SCENES} unique sources; sources may cycle.", "warning")
+    search_terms = get_search_terms(
+        data["videoSubject"], min(amount_of_stock_videos, media_target), script, ai_model
+    )
+    emit(f"[+] Generated search terms: {search_terms}")
+    video_paths = select_media(
+        search_terms, data["videoSubject"], orientation, media_target,
+        guard_cancelled, emit,
+    )
 
     try:
         subtitles_path = generate_subtitles(
@@ -307,18 +333,15 @@ def run_generation_pipeline(
             "Could not generate subtitles. Check AssemblyAI key or local subtitle settings."
         )
 
-    temp_audio = AudioFileClip(tts_path)
-    try:
-        combined_video_path = combine_videos(
-            video_paths,
-            temp_audio.duration,
-            max_clip_duration,
-            n_threads or 2,
-            target_width,
-            target_height,
-        )
-    finally:
-        temp_audio.close()
+    guard_cancelled()
+    combined_video_path = combine_videos(
+        video_paths,
+        audio_duration,
+        max_clip_duration,
+        n_threads or 2,
+        target_width,
+        target_height,
+    )
 
     try:
         final_video_path = generate_video(

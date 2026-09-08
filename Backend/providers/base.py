@@ -45,6 +45,17 @@ def image_fallback_enabled() -> bool:
     return os.getenv("ENABLE_IMAGE_FALLBACK", "true").strip().lower() in {"true", "1", "yes", "on"}
 
 
+def media_min_score() -> float:
+    try:
+        value = float(os.getenv("MEDIA_MIN_SCORE", "3.0"))
+        if math.isfinite(value):
+            return value
+    except ValueError:
+        pass
+    log("[Media] Invalid MEDIA_MIN_SCORE; using 3.0.", "warning")
+    return 3.0
+
+
 def max_image_clips() -> int:
     try:
         value = int(os.getenv("MAX_IMAGE_CLIPS", "4"))

@@ -26,6 +26,7 @@ def isolated_media(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MEDIA_PROVIDERS", "pexels,pixabay,nasa")
     monkeypatch.setenv("ENABLE_IMAGE_FALLBACK", "true")
     monkeypatch.setenv("MAX_IMAGE_CLIPS", "4")
+    monkeypatch.setenv("MEDIA_MIN_SCORE", "3.0")
     monkeypatch.setenv("MEDIA_SEARCH_TIMEOUT", "30")
     monkeypatch.setenv("MEDIA_DOWNLOAD_TIMEOUT", "60")
     monkeypatch.setattr(base, "_disabled_logged", set())
@@ -192,7 +193,7 @@ def test_selection_global_id_url_deduplication_and_broader_fallback(monkeypatch:
 
 
 @pytest.mark.parametrize("enabled,limit,expected", [("true", "2", 2), ("false", "4", 0), ("true", "0", 0)])
-def test_image_fallback_cap_and_video_preference(monkeypatch: pytest.MonkeyPatch, enabled: str,
+def test_image_fallback_cap_and_enable_setting(monkeypatch: pytest.MonkeyPatch, enabled: str,
                                                 limit: str, expected: int) -> None:
     monkeypatch.setenv("ENABLE_IMAGE_FALLBACK", enabled)
     monkeypatch.setenv("MAX_IMAGE_CLIPS", limit)
@@ -200,14 +201,15 @@ def test_image_fallback_cap_and_video_preference(monkeypatch: pytest.MonkeyPatch
         "a": [candidate(str(i), "image", "pixabay") for i in range(6)] + [candidate("v1")],
         "b": [candidate("v2")],
     }, 10)
-    assert [item.media_type for item in downloaded[:2]] == ["video", "video"]
+    assert sum(item.media_type == "video" for item in downloaded) == 2
     assert sum(item.media_type == "image" for item in downloaded) == expected
 
 
 def test_strong_nasa_image_beats_poor_video(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, downloaded = select(monkeypatch, {"a": [candidate("image", "image", "nasa", score=10), candidate("bad", score=-5)],
-                                        "b": [candidate("good")]}, 2)
+    calls, downloaded = select(monkeypatch, {"a": [candidate("mediocre", score=4), candidate("spare", score=3)],
+                                           "b": [candidate("good"), candidate("image", "image", "nasa", score=10)]}, 2)
     assert [item.source_id for item in downloaded] == ["image", "good"]
+    assert calls == ["a", "b"]
 
 
 def test_single_item_fails_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,7 +362,7 @@ def test_pipeline_requests_images_only_after_video_shortfall(monkeypatch: pytest
     monkeypatch.setattr(pipeline, "download_media", lambda item: downloaded.append(item) or item.download_url)
     paths = pipeline.select_media(["a", "b"], "Jupiter", "portrait", 2, lambda: None, lambda *args: None)
     assert len(paths) == len(set(paths)) == 2
-    assert sum(image_pass for _, image_pass in calls) == (0 if enough_videos else 1)
+    assert sum(image_pass for _, image_pass in calls) == (0 if enough_videos else 3)
     assert [item.media_type for item in downloaded] == ["video", "video" if enough_videos else "image"]
 
 

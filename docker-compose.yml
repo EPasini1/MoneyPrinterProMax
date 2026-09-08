@@ -52,14 +52,17 @@ services:
       - MEDIA_PROVIDERS=${MEDIA_PROVIDERS-pexels,pixabay,nasa}
       - ENABLE_IMAGE_FALLBACK=${ENABLE_IMAGE_FALLBACK:-true}
       - MAX_IMAGE_CLIPS=${MAX_IMAGE_CLIPS:-4}
+      - MEDIA_MIN_SCORE=${MEDIA_MIN_SCORE:-3.0}
       - MEDIA_DOWNLOAD_TIMEOUT=${MEDIA_DOWNLOAD_TIMEOUT:-60}
       - MEDIA_SEARCH_TIMEOUT=${MEDIA_SEARCH_TIMEOUT:-30}
       - MEDIA_CACHE_DIR=${MEDIA_CACHE_DIR:-/app/media-cache}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - OLLAMA_THINK=${OLLAMA_THINK:-false}
       - STOCK_VIDEO_COUNT=${STOCK_VIDEO_COUNT:-10}
       - MAX_CLIP_DURATION=${MAX_CLIP_DURATION:-6}
       - SCRIPT_FACT_CHECK=${SCRIPT_FACT_CHECK:-true}
+      - FACT_CHECK_REQUIRE_SOURCES=${FACT_CHECK_REQUIRE_SOURCES:-true}
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://moneyprinter:moneyprinter@postgres:5432/moneyprinter}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -90,14 +93,17 @@ services:
       - MEDIA_PROVIDERS=${MEDIA_PROVIDERS-pexels,pixabay,nasa}
       - ENABLE_IMAGE_FALLBACK=${ENABLE_IMAGE_FALLBACK:-true}
       - MAX_IMAGE_CLIPS=${MAX_IMAGE_CLIPS:-4}
+      - MEDIA_MIN_SCORE=${MEDIA_MIN_SCORE:-3.0}
       - MEDIA_DOWNLOAD_TIMEOUT=${MEDIA_DOWNLOAD_TIMEOUT:-60}
       - MEDIA_SEARCH_TIMEOUT=${MEDIA_SEARCH_TIMEOUT:-30}
       - MEDIA_CACHE_DIR=${MEDIA_CACHE_DIR:-/app/media-cache}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - OLLAMA_THINK=${OLLAMA_THINK:-false}
       - STOCK_VIDEO_COUNT=${STOCK_VIDEO_COUNT:-10}
       - MAX_CLIP_DURATION=${MAX_CLIP_DURATION:-6}
       - SCRIPT_FACT_CHECK=${SCRIPT_FACT_CHECK:-true}
+      - FACT_CHECK_REQUIRE_SOURCES=${FACT_CHECK_REQUIRE_SOURCES:-true}
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://moneyprinter:moneyprinter@postgres:5432/moneyprinter}
     extra_hosts:
       - "host.docker.internal:host-gateway"

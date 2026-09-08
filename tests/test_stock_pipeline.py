@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Iterator
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -9,6 +10,7 @@ import gpt
 import pipeline
 import search
 import video
+from fact_sources import FactSource
 from utils import get_max_clip_duration, get_stock_video_count
 from providers.base import MediaCandidate
 
@@ -88,6 +90,9 @@ def test_search_terms_connection_failure_uses_fallback(monkeypatch) -> None:
 
 
 def test_verification_preserves_raw_corrected_narration(monkeypatch) -> None:
+    monkeypatch.setattr(gpt, "retrieve_fact_sources", lambda *args: [
+        FactSource("NASA", "Jupiter Facts", "https://science.nasa.gov/jupiter/", "Jupiter has clouds."),
+    ])
     def respond(prompt: str, model: str) -> str:
         assert "every factual claim" in prompt
         assert "Do not invent replacement statistics" in prompt
@@ -213,7 +218,16 @@ def test_pexels_http_failure_returns_no_candidates(monkeypatch) -> None:
     assert search.search_for_stock_videos("Jupiter planet", "test", 15, 6) == []
 
 
-def test_pipeline_reports_empty_candidate_pool_before_tts(monkeypatch) -> None:
+def _mock_narration_audio(monkeypatch: pytest.MonkeyPatch, duration: float = 1.0) -> Mock:
+    factory = Mock(side_effect=lambda *args: Mock(duration=duration))
+    monkeypatch.setattr(pipeline, "AudioFileClip", factory)
+    monkeypatch.setattr(pipeline, "concatenate_audioclips", Mock(return_value=Mock(duration=duration)))
+    monkeypatch.setattr(pipeline, "tts", Mock())
+    return factory
+
+
+def test_pipeline_reports_empty_candidate_pool_after_audio(monkeypatch) -> None:
+    _mock_narration_audio(monkeypatch)
     monkeypatch.setenv("SCRIPT_FACT_CHECK", "false")
     monkeypatch.delenv("STOCK_VIDEO_COUNT", raising=False)
     monkeypatch.setattr(pipeline, "generate_script", lambda *args: "Jupiter narration.")
@@ -258,9 +272,11 @@ def test_failed_download_removes_partial_file(monkeypatch, tmp_path) -> None:
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(monkeypatch, enabled) -> None:
+    _mock_narration_audio(monkeypatch)
     monkeypatch.setenv("STOCK_VIDEO_COUNT", "3")
     monkeypatch.setenv("MAX_CLIP_DURATION", "7")
     monkeypatch.setenv("SCRIPT_FACT_CHECK", str(enabled))
+    monkeypatch.setenv("MEDIA_MIN_SCORE", "3.0")
     monkeypatch.setattr(pipeline, "generate_script", lambda *args: "Original script.")
     verification_calls = []
 
@@ -274,7 +290,7 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
         return ["query one", "query two", "query three"]
 
     def candidate(video_id: int, url: str = "") -> MediaCandidate:
-        return MediaCandidate("pexels", "video", str(video_id), "query", url or f"url-{video_id}", "", 1080, 1920, 8)
+        return MediaCandidate("pexels", "video", str(video_id), "query", url or f"url-{video_id}", "", 1080, 1920, 8, score=5)
 
     groups = {
         "query one": [candidate(1), candidate(3), candidate(3, "alternate-after-failure"), candidate(4)],
@@ -296,12 +312,8 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
             raise RuntimeError("download failed")
         return url
 
-    class ReachedTTS(Exception):
-        pass
-
     def tts(sentence: str, voice: str, filename: str) -> None:
         assert sentence == ("Corrected script." if enabled else "Original script.")
-        raise ReachedTTS()
 
     monkeypatch.setattr(pipeline, "verify_and_rewrite_script", verify)
     monkeypatch.setattr(pipeline, "get_search_terms", terms)
@@ -309,15 +321,82 @@ def test_pipeline_uses_spares_deduplicates_ids_and_checks_script_before_search(m
     monkeypatch.setenv("MEDIA_PROVIDERS", "nasa")
     monkeypatch.setattr(pipeline, "download_media", save)
     monkeypatch.setattr(pipeline, "tts", tts)
+    monkeypatch.setattr(pipeline, "generate_subtitles", Mock(return_value=None))
     logs = []
-    with pytest.raises(ReachedTTS):
+    with pytest.raises(RuntimeError, match="Could not generate subtitles"):
         pipeline.run_generation_pipeline(
             {"videoSubject": "Jupiter", "customPrompt": "", "voice": "en_us_001"},
             lambda: False, lambda message, level: logs.append(message),
         )
     assert bool(verification_calls) == enabled
-    assert downloads == ["url-1", "url-2", "url-3", "alternate-after-failure"]
+    assert downloads == ["url-1", "url-3", "alternate-after-failure", "url-4"]
     assert any("Selected 3 unique media items" in message for message in logs)
+    if enabled:
+        assert callable(verification_calls[0][-1])  # Verification logs use the persisted job callback.
+
+
+@pytest.mark.parametrize("duration, configured, expected", [
+    (65, 10, (11, 11)), (65.1, 10, (11, 11)), (60, 10, (10, 10)),
+    (60.001, 10, (11, 11)), (6, 10, (1, 10)), (65.1, 20, (11, 20)),
+    (6, 1, (1, 2)), (1000, 10, (167, 120)), (6, 200, (1, 120)),
+])
+def test_dynamic_media_requirement(duration: float, configured: int, expected: tuple) -> None:
+    assert pipeline.media_requirement(duration, 6, configured) == expected
+
+
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf")])
+def test_invalid_audio_duration_fails(duration: float) -> None:
+    with pytest.raises(RuntimeError, match="positive finite duration"):
+        pipeline.media_requirement(duration, 6, 10)
+
+
+@pytest.mark.parametrize("quality_count", [8, 12])
+def test_pipeline_uses_measured_audio_and_cycles_only_quality_sources(monkeypatch: pytest.MonkeyPatch,
+                                                                    quality_count: int) -> None:
+    _mock_narration_audio(monkeypatch, 65.1)
+    monkeypatch.setattr(pipeline, "concatenate_audioclips", Mock(return_value=Mock(duration=60)))
+    monkeypatch.setenv("SCRIPT_FACT_CHECK", "false")
+    monkeypatch.setenv("STOCK_VIDEO_COUNT", "10")
+    monkeypatch.setenv("MAX_CLIP_DURATION", "6")
+    monkeypatch.setenv("MEDIA_MIN_SCORE", "3")
+    monkeypatch.setenv("MEDIA_PROVIDERS", "nasa")
+    monkeypatch.setenv("ENABLE_IMAGE_FALLBACK", "false")
+    monkeypatch.setattr(pipeline, "generate_script", Mock(return_value="Jupiter narration."))
+    terms = Mock(return_value=["Jupiter"])
+    monkeypatch.setattr(pipeline, "get_search_terms", terms)
+    candidates = [MediaCandidate("nasa", "video", str(i), "Jupiter", f"url-{i}", None,
+                                 1080, 1920, 6, score=5 if i < quality_count else 2) for i in range(15)]
+    monkeypatch.setattr(pipeline, "search_media_candidates", Mock(return_value=candidates))
+    download = Mock(side_effect=lambda candidate: candidate.download_url)
+    monkeypatch.setattr(pipeline, "download_media", download)
+    monkeypatch.setattr(pipeline, "generate_subtitles", Mock(return_value="subtitles.srt"))
+    class ReachedCombine(Exception):
+        pass
+    combine = Mock(side_effect=ReachedCombine)
+    monkeypatch.setattr(pipeline, "combine_videos", combine)
+    logs = []
+    with pytest.raises(ReachedCombine):
+        pipeline.run_generation_pipeline({"videoSubject": "Jupiter", "customPrompt": ""}, None,
+                                         lambda message, level: logs.append(message))
+    selected_count = min(quality_count, 11)
+    assert combine.call_args.args[:3] == ([f"url-{i}" for i in range(selected_count)], 65.1, 6)
+    assert download.call_count == selected_count
+    assert terms.call_args.args[1] == 10  # More scenes do not require more LLM queries.
+    assert "[Media] Audio duration: 65.1s" in logs
+    assert "[Media] Unique scenes required at 6s max: 11" in logs
+    assert "[Media] Target scenes: 11" in logs
+    assert any("Only 8 of 11" in message for message in logs) == (quality_count == 8)
+
+
+def test_tts_failure_closes_previous_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    clip = Mock(duration=2)
+    monkeypatch.setenv("SCRIPT_FACT_CHECK", "false")
+    monkeypatch.setattr(pipeline, "generate_script", Mock(return_value="First sentence. Second sentence."))
+    monkeypatch.setattr(pipeline, "AudioFileClip", Mock(return_value=clip))
+    monkeypatch.setattr(pipeline, "tts", Mock(side_effect=[None, RuntimeError("TTS unavailable")]))
+    with pytest.raises(RuntimeError, match="TTS unavailable"):
+        pipeline.run_generation_pipeline({"videoSubject": "Jupiter", "customPrompt": ""}, None, None)
+    clip.close.assert_called_once()
 
 
 @pytest.mark.parametrize("size", [(90, 160), (160, 90), (100, 100), (80, 100)])

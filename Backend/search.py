@@ -9,13 +9,16 @@ from providers.base import MediaCandidate, MediaProvider
 from providers.nasa import NasaProvider
 from providers.pexels import PexelsProvider, StockVideo, search_for_stock_videos
 from providers.pixabay import PixabayProvider
-from providers.ranking import _subject_tokens, _relevance_score
+from providers.ranking import (
+    _nasa_program_penalty, _subject_anchor_score, _subject_tokens,
+    _query_context_evidence, _relevance_score, _title_evidence_score,
+)
 from utils import get_max_clip_duration
 
 
 SPACE_PATTERN = re.compile(
     r"\b(?:space|planets?|galaxy|galaxies|universe|nasa|moon|mars|jupiter|saturn|"
-    r"venus|mercury|neptune|uranus|asteroids?|comets?|telescopes?|astronomy|"
+    r"venus|mercury|neptune|uranus|sun|earth|pluto|asteroids?|comets?|telescopes?|astronomy|"
     r"solar\s+system|stars?|nebula|black\s+hole)\b", re.IGNORECASE,
 )
 
@@ -44,10 +47,18 @@ def get_enabled_providers(video_subject: str = "", query: str = "") -> list[Medi
 
 
 def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_subject: str) -> list[MediaCandidate]:
+    subject_tokens = _subject_tokens(video_subject)
     for item in candidates:
-        metadata = " ".join(filter(None, (item.title, item.description)))
+        metadata = "\n".join(filter(None, (item.title, item.description)))
         query_tokens = _subject_tokens(item.query)
-        score = _relevance_score(query_tokens, _subject_tokens(metadata))
+        metadata_tokens = _subject_tokens(metadata)
+        score = _relevance_score(query_tokens, metadata_tokens)
+        score += _subject_anchor_score(subject_tokens, metadata_tokens)
+        score += _title_evidence_score(item.title or "", query_tokens, subject_tokens)
+        context_score, sufficient_evidence = _query_context_evidence(item.query, video_subject, metadata)
+        score += context_score
+        if item.provider == "nasa" and item.media_type == "video":
+            score -= _nasa_program_penalty(item.title or "")
         # Exact multiword names/entities provide stronger evidence than one generic word.
         phrase = " ".join(re.findall(r"\w+", item.query.casefold()))
         normalized = " ".join(re.findall(r"\w+", metadata.casefold()))
@@ -59,9 +70,11 @@ def rank_candidates(candidates: list[MediaCandidate], orientation: str, video_su
             score += 1 if min(item.width, item.height) >= 720 else -2
         if item.duration is not None:
             score += 1 if item.duration >= get_max_clip_duration() else -1
-        if item.provider == "nasa" and is_space_topic(video_subject, item.query):
-            score += 2
-        item.score = score
+        if (item.provider == "nasa" and is_space_topic(video_subject, item.query)
+                and metadata_tokens & (subject_tokens | query_tokens)):
+            score += 5
+        # A technical/provider bonus cannot rescue one ambiguous query component.
+        item.score = score if sufficient_evidence else min(score, -4.0)
     return sorted(candidates, key=lambda item: -item.score)
 
 
